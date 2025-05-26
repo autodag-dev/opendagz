@@ -1,0 +1,6 @@
+[term]
+color = "always"
+
+# Override incompatible parent .cargo flags
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "prefer-dynamic=no",]

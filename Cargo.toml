@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = [
+    "cmd",
+    "cargo-zb",
+]
+
+[profile.release]
+lto = "thin"

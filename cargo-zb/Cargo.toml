@@ -1,0 +1,52 @@
+[package]
+name = "cargo-zb"
+version = "0.1.0"
+edition = "2024"
+description = "Cargo build with better caching"
+
+[[bin]]
+name = "cargo-zb"
+path = "src/main.rs"
+
+[dependencies]
+cargo = "0.94"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+# Hashing (content-based cache keys)
+blake3 = "1.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Local cache (LMDB via heed)
+heed = { version = "0.21", default-features = false }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+libc = "0.2"
+tempfile = "3"
+walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# TiKV distributed cache (optional)
+[dependencies.tikv-client]
+version = "0.3"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread"]
+optional = true
+
+[features]
+default = []
+tikv = ["tikv-client", "tokio"]

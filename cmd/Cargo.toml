@@ -1,0 +1,23 @@
+[package]
+name = "opendagz"
+version = "0.1.1"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Dagz Accelered CI Platform, Open Edition"
+repository = "https://github.com/autodag-dev/opendagz"
+readme = "../README.md"
+keywords = ["performance", "metrics", "ci", "build", "tracing"]
+
+[[bin]]
+name = "zb"
+path = "src/main.rs"
+
+
+[dependencies]
+clap = { version = "4.5.20", default-features = false, features = ["derive", "std", "help", "usage", "color", "error-context"] }
+nix = { version = "0.30.1", features = ["process", "ptrace", "signal", "feature", "fs"] }
+chrono = "0.4.41"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+colored = { version = "3.0.0", default-features = false }
+signal-hook = { version = "0.3.17", default-features = false }
