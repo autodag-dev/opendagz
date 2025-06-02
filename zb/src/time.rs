@@ -3,9 +3,16 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
 use std::ffi::CString;
 use std::{process};
+use std::fs::File;
 use nix::libc;
 use tracing::{debug, error, trace, Level};
-use crate::thread_monitor::{ProcessEnd, ThreadMonitor};
+//use tracing_subscriber::filter::LevelFilter;
+//use tracing_subscriber::fmt::writer::MakeWriterExt;
+//use tracing_subscriber::layer::SubscriberExt;
+//use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, prelude::*, filter::LevelFilter};
+use tracing_subscriber::fmt::{writer::MakeWriterExt};
+use crate::thread_monitor::{ProcessEndReason, ThreadMonitor};
 
 #[derive(clap::Args)]
 pub(crate) struct TimeCommand {
@@ -17,6 +24,9 @@ pub(crate) struct TimeCommand {
     #[arg(short, long, default_value = "real")]
     format: String,
 
+    #[arg(long, help = "Debug log file")]
+    log: Option<String>,
+
     /// Command and arguments to time
     #[arg(trailing_var_arg = true, required = true)]
     args: Vec<String>,
@@ -25,7 +35,11 @@ pub(crate) struct TimeCommand {
 impl TimeCommand {
     fn cont(&self, pid: Pid) {
         ptrace::cont(pid, None).unwrap_or_else(|e| {
-            error!("Failed to continue process {}: {}", pid, e);
+            if e != nix::Error::ESRCH {
+                debug!("Process {} already exited, cannot continue", pid);
+            } else {
+                error!("Failed to continue process {}: {}", pid, e);
+            }
         });
     }
     
@@ -52,11 +66,13 @@ impl TimeCommand {
         loop {
             let wait_result = nix::sys::wait::waitpid(None, WaitPidFlag::__WALL.into());
             match wait_result {
-                Ok(WaitStatus::Exited(pid, status)) => {
+                Ok(WaitStatus::Exited(tid, status)) => {
+                    trace!("waitpid result exit: {:?}", wait_result);
+                    monitor.finish_thread(tid, ProcessEndReason::LateExitCode(status));
                     if monitor.active_procs.is_empty() {
                         debug!("all child processes have exited, expecting last wait");
                     }
-                    if pid == root_pid {
+                    if tid == root_pid {
                         root_exit_code = Some(status);
                     }
                 }
@@ -70,6 +86,8 @@ impl TimeCommand {
                 }
                 Ok(WaitStatus::PtraceEvent(parent_tid, _signal, event)) => {
                     let event_data = ptrace::getevent(parent_tid);
+                    self.cont(parent_tid);
+                    trace!("waitpid result: {:?} data={}", wait_result, event_data.unwrap_or(-1));
                     match event {
                         libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                             match event_data {
@@ -93,7 +111,7 @@ impl TimeCommand {
                                         .split('\0')
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>();
-                                    monitor.start_proc(parent_tid, argv[0].clone(), argv.clone(), Some(prev_tid));
+                                    monitor.start_proc(parent_tid, argv, Some(prev_tid));
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -103,7 +121,7 @@ impl TimeCommand {
                         libc::PTRACE_EVENT_EXIT => {
                             match event_data {
                                 Ok(exit_code) => {
-                                    monitor.finish_thread(parent_tid, ProcessEnd::ExitCode(exit_code as i32));
+                                    monitor.finish_thread(parent_tid, ProcessEndReason::ExitCode(exit_code as i32 >> 8));
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -118,13 +136,8 @@ impl TimeCommand {
                             error!("Unhandled ptrace event: {:?}", wait_result);
                         }
                     }
-
-                    self.cont(parent_tid);
                 }
                 Ok(WaitStatus::Stopped(pid, signal)) => {
-                    if signal != nix::sys::signal::SIGUSR1 {
-                        trace!("child process {} stopped with signal {}", pid, signal);
-                    }
                     if monitor.active_procs.is_empty() {
                         // first child
                         ptrace::setoptions(
@@ -138,10 +151,12 @@ impl TimeCommand {
                         .unwrap_or_else(|e| {
                             error!("Failed to set ptrace options for child process {}: {}", pid, e)
                         });
-                        monitor.start_proc(pid, self.args[0].clone(), self.args.clone(), None);
+                        monitor.start_proc(pid, self.args.clone(), None);
                     }
-
                     self.cont(pid);
+                    if signal != nix::sys::signal::SIGUSR1 {
+                        trace!("thread {} stop with signal {}", pid, signal);
+                    }
                 }
                 Ok(_) => {
                     error!("unexpected waitpid event {:?}", wait_result);
@@ -164,8 +179,25 @@ impl TimeCommand {
     }
 
     pub(crate) fn run(&self) {
-        tracing_subscriber::fmt().with_max_level(Level::TRACE).init();
-        
+        let console_layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(true)
+            .with_filter(LevelFilter::WARN);
+
+        let tracing_builder = tracing_subscriber::registry()
+            .with(console_layer);
+
+        if let Some(log) = &self.log {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(File::create(log).expect("Failed to create log file"))
+                .with_ansi(true)
+                .with_filter(LevelFilter::TRACE);
+
+                tracing_builder.with(file_layer).init();
+        } else {
+            tracing_builder.init();
+        }
+
         match self.run_impl() {
             Ok(_) => (),
             Err(e) => {
