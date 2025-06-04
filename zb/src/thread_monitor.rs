@@ -1,33 +1,13 @@
 use std::collections::{hash_map, HashMap, HashSet};
-use std::{fs, mem, ptr};
+use std::{fs, io, mem};
 use std::cell::RefCell;
 use std::io::stdout;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd};
 use std::rc::Rc;
 use chrono::{DateTime, Duration, Utc};
 use nix::unistd::Pid;
 use tracing::{debug, error, trace};
 use colored::Colorize;
-
-struct ProcessEnd {
-    end_time: DateTime<Utc>,
-    rss_kb: i64,
-    reason: ProcessEndReason,
-}
-
-pub(crate) struct ProcessSpan {
-    ordinal: usize,
-    parent: Option<Rc<RefCell<ProcessSpan>>>,
-    pid: Pid,
-    argv: Vec<String>,
-    total_threads: usize,
-    active_threads: HashSet<Pid>,
-    start_time: DateTime<Utc>,
-    cpu_time: Duration,
-    elapsed: Duration,
-    children: Vec<Rc<RefCell<ProcessSpan>>>,
-    end: Option<ProcessEnd>,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) enum ProcessEndReason {
@@ -37,36 +17,69 @@ pub(crate) enum ProcessEndReason {
     Exec
 }
 
+struct ProcessEnd {
+    reason: ProcessEndReason,
+}
+
+pub(crate) struct ProcessSpan {
+    // Init args
+    ordinal: usize,
+    pid: Pid,
+    argv: Vec<String>,
+    start_time: DateTime<Utc>,
+
+    // Relations
+    parent: Option<Rc<RefCell<ProcessSpan>>>,
+    active_threads: HashSet<Pid>,
+    children: Vec<Rc<RefCell<ProcessSpan>>>,
+
+    // Accumulators
+    total_threads: usize,
+    self_cpu_time: Duration,
+    tree_cpu_time: Duration,
+    self_elapsed: Duration,
+    tree_end_time: DateTime<Utc>,
+    end: Option<ProcessEnd>,
+}
+
 impl ProcessSpan {
     pub(crate) fn elapsed(&self) -> Duration {
-        self.end.as_ref().unwrap().end_time - self.start_time
+        self.tree_end_time - self.start_time
     }
 
-    fn tree_depth(&self) -> usize {
+    fn compile_tree(&mut self) -> usize {
         let mut depth = 0;
+        let mut total_cpu = self.self_cpu_time;
         for child in &self.children {
-            depth = depth.max(1 + child.borrow().tree_depth());
+            let mut child = child.borrow_mut();
+            let child_depth = child.compile_tree();
+            total_cpu += child.tree_cpu_time;
+            depth = depth.max(1 + child_depth);
+            self.tree_end_time = self.tree_end_time.max(child.tree_end_time);
         }
+        self.tree_cpu_time = total_cpu;
         depth
     }
 }
 
 struct ThreadSpan {
-    tid: Pid,
     proc: Option<Rc<RefCell<ProcessSpan>>>,
     start_time: DateTime<Utc>,
     last_cpu_time: Duration,
     unbound_child_tids: Vec<Pid>,
-    orphan_proc: Option<Rc<RefCell<ProcessSpan>>>,  // for execing threads, the associated proces if no ppid is known during exec
+
+    /// for execing threads, the associated proces if no ppid is known during exec
+    orphan_proc: Option<Rc<RefCell<ProcessSpan>>>,
+
+    /// Threads born without parent will be kept in active threads even after they have finished.
     born_orphan: bool,
 
     end_reason: Option<ProcessEndReason>,
 }
 
 impl ThreadSpan {
-    fn new_orphan(tid: Pid) -> Self {
+    fn new_orphan() -> Self {
         Self {
-            tid,
             proc: None,
             start_time: Utc::now(),
             last_cpu_time: Default::default(),
@@ -84,6 +97,25 @@ impl ThreadSpan {
 }
 
 #[derive(Default)]
+struct ProcessGroup {
+    num_procs: usize,
+    total_elapsed: Duration,
+    total_self_cpu_time: Duration,
+    total_tree_cpu_time: Duration,
+}
+
+impl ProcessGroup {
+    fn add(&mut self, proc: Rc<RefCell<ProcessSpan>>) {
+        let proc = proc.borrow();
+        self.num_procs += 1;
+        self.total_elapsed += proc.elapsed();
+        self.total_self_cpu_time += proc.self_cpu_time;
+        self.total_tree_cpu_time += proc.tree_cpu_time;
+    }
+}
+
+
+#[derive(Default)]
 pub(crate) struct ThreadMonitor {
     page_size_kb: i64,
     ticks_per_sec: f64,
@@ -93,6 +125,7 @@ pub(crate) struct ThreadMonitor {
     active_threads: HashMap<Pid, ThreadSpan>,
     pub(crate) active_procs: HashMap<Pid, Rc<RefCell<ProcessSpan>>>,
     finished_procs: Vec<Rc<RefCell<ProcessSpan>>>,
+    root: Option<Rc<RefCell<ProcessSpan>>>,
 }
 
 impl ThreadMonitor {
@@ -154,17 +187,6 @@ impl ThreadMonitor {
             debug!("Thread {} is already finished, not binding to process #{} {}",
                 tid, proc.ordinal, proc.pid);
         }
-
-        // if let Some(unbound_proc_rc) = &thread.orphan_proc {
-        //     //if !ptr::eq(proc_rc.as_ptr(), unbound_proc_rc.as_ptr()) {
-        //         let mut unbound_proc = unbound_proc_rc.borrow_mut();
-        //         debug!("try bind pid {} to ppid {pid}", unbound_proc.pid);
-        //         unbound_proc.parent = Some(proc_rc.clone());
-        //         proc.children.push(unbound_proc_rc.clone());
-        //         drop(unbound_proc);
-        //         thread.orphan_proc = None;
-        //     //}
-        // }
         drop(proc);
 
         if !thread.unbound_child_tids.is_empty() {
@@ -227,8 +249,9 @@ impl ThreadMonitor {
             }
         };
         let mut proc = proc_rc.borrow_mut();
-        proc.elapsed += end_time - thread.start_time;
-        proc.cpu_time += cpu_time - thread.last_cpu_time;
+        proc.self_elapsed += end_time - thread.start_time;
+        proc.self_cpu_time += cpu_time - thread.last_cpu_time;
+        proc.tree_end_time = proc.tree_end_time.max(end_time);
 
         thread.start_time = end_time;
         thread.last_cpu_time = cpu_time;
@@ -238,16 +261,9 @@ impl ThreadMonitor {
         if proc.active_threads.is_empty() {
             debug!("Process #{} {} pid={} finished by {:?}",
                 proc.ordinal, proc.argv[0], proc.pid, reason);
-            let proc_stat = fs::read_to_string(format!("/proc/{}/stat", tid))
-                .expect("Failed to read /proc/[pid]/stat");
-            let post_parens = proc_stat.split_once(')').unwrap().1;
-            let parts: Vec<&str> = post_parens.split_whitespace().collect();
 
-            let rss_kb = parts[21].parse::<i64>().unwrap_or(0) * self.page_size_kb;
             self.active_procs.remove(&proc_pid).unwrap();
             proc.end = Some(ProcessEnd {
-                rss_kb,
-                end_time,
                 reason,
             });
             self.finished_procs.push(proc_rc.clone());
@@ -265,14 +281,14 @@ impl ThreadMonitor {
     pub(crate) fn start_thread(&mut self, tid: Pid, parent_tid: Pid, _event: i32) {
         let parent = self.active_threads.entry(parent_tid).or_insert_with(|| {
             debug!("Created orphan parent thread implicitly {} by tid={}", parent_tid, tid);
-            ThreadSpan::new_orphan(parent_tid)
+            ThreadSpan::new_orphan()
         });
         let proc = parent.proc.as_ref().cloned();
         if proc.is_none() {
             debug!("Thread started {} without parent tid={}", tid, parent_tid);
             parent.unbound_child_tids.push(tid);
         }
-        self.active_threads.entry(tid).or_insert_with(|| ThreadSpan::new_orphan(tid));
+        self.active_threads.entry(tid).or_insert_with(ThreadSpan::new_orphan);
 
         if let Some(proc) = &proc {
             let pid = proc.borrow().pid;
@@ -280,12 +296,12 @@ impl ThreadMonitor {
         }
     }
 
-    pub(crate) fn start_proc(&mut self, pid: Pid, argv: Vec<String>, prev_tid: Option<Pid>) {
+    pub(crate) fn handle_exec(&mut self, pid: Pid, argv: Vec<String>, prev_tid: Option<Pid>) {
         let start_time = Utc::now();
         let mut born_orphan = false;
         let mut parent_proc = None;
         if let Some(prev_tid) = prev_tid {
-            if let Some(parent_thread) = self.active_threads.get(&prev_tid) {
+            if let Some(_parent_thread) = self.active_threads.get(&prev_tid) {
                 trace!("Finishing previous process thread {} before new process {}", prev_tid, pid);
                 parent_proc = self.unbind_tid(prev_tid, ProcessEndReason::Exec);
             } else {
@@ -307,17 +323,22 @@ impl ThreadMonitor {
             total_threads: 0,
             active_threads: Default::default(),
             start_time,
-            cpu_time: Default::default(),
-            elapsed: Default::default(),
+            self_cpu_time: Default::default(),
+            tree_cpu_time: Default::default(),
+            self_elapsed: Default::default(),
             children: Default::default(),
+            tree_end_time: start_time,
             end: None,
         }));
+        if ordinal == 1 {
+            self.root = Some(new_proc.clone());
+        }
         if let Some(parent_proc) = &parent_proc {
             parent_proc.borrow_mut().children.push(new_proc.clone());
         }
 
         self.active_threads.entry(pid).or_insert_with(|| ThreadSpan {
-            tid: pid,
+            //tid: pid,
             proc: None,
             start_time,
             born_orphan,
@@ -350,22 +371,25 @@ impl ThreadMonitor {
             },
             hash_map::Entry::Vacant(entry) => {
                 debug!("Finished thread {} died orphan, end={:?}", tid, proc_end);
-                entry.insert(ThreadSpan::new_orphan(tid).with_end_reason(proc_end));
+                entry.insert(ThreadSpan::new_orphan().with_end_reason(proc_end));
             }
         }
 
         finished_proc
     }
 
-    fn print_tree(&self, proc: &ProcessSpan, indent: &mut String, postfix: &mut String, last: bool, is_root: bool) {
+    fn print_tree(&self, output: &mut dyn io::Write, proc: &ProcessSpan, indent: &mut String, postfix: &mut String, last: bool, is_root: bool) {
         let proc_end = proc.end.as_ref().unwrap();
         let elapsed = proc.elapsed();
-        let cpu_pct = 100.0 * proc.cpu_time.as_seconds_f64() / elapsed.as_seconds_f64();
+        let cpu_pct = 100.0 * proc.self_cpu_time.as_seconds_f64() / elapsed.as_seconds_f64();
         let connector = if is_root { "" } else if last { "└─" } else { "├─" };
 
         let argv_cutoff = if self.is_tty { 100 } else { 0 };
-        println!("{indent}{connector}{:<5}{postfix} {:<8} {:9.3}s {:7.1}%cpu {:<4} threads {:>6}MB  {:.argv_cutoff$}",
+        writeln!(output, "{indent}{connector}{:<5}{postfix} {:9.3}s {:7.1}%cpu {:>4} threads {:>8} {:.argv_cutoff$}",
              format!("#{}", proc.ordinal),
+             elapsed.as_seconds_f64(),
+             cpu_pct,
+             proc.total_threads,
              match proc_end.reason {
                  ProcessEndReason::ExitCode(code) | ProcessEndReason::LateExitCode(code) => {
                      if code == 0 { format!("[rc={}]", code).normal() } else { format!("[rc={}]", code).bright_red() }
@@ -373,12 +397,8 @@ impl ThreadMonitor {
                  ProcessEndReason::Signal(signal) => format!("[killed by {}]", signal).bright_red(),
                  ProcessEndReason::Exec => "[exec]".to_string().normal(),
              },
-             elapsed.as_seconds_f64(),
-             cpu_pct,
-             proc.total_threads,
-             proc_end.rss_kb / 1024,
              proc.argv.join(" "),
-        );
+        ).expect("Failed to write to output");
 
         let prev_indent_len = indent.len();
 
@@ -387,74 +407,69 @@ impl ThreadMonitor {
             indent.push_str(if last { "  " } else { "│ " });
         }
         for (num, child) in proc.children.iter().enumerate() {
-            self.print_tree(&child.borrow(), indent, postfix, num == proc.children.len() - 1, false);
+            self.print_tree(output, &child.borrow(), indent, postfix, num == proc.children.len() - 1, false);
         }
-        postfix.push_str("  ");;
+        postfix.push_str("  ");
         if !is_root {
             indent.truncate(prev_indent_len);
         }
     }
 
-    pub(crate) fn report(&self) {
-        let mut procs_by_cmd: HashMap<String, Vec<Rc<RefCell<ProcessSpan>>>> = Default::default();
+    pub(crate) fn report(&self, output: &mut dyn io::Write) {
+        let mut proc_groups: HashMap<String, ProcessGroup> = Default::default();
+        let mut root = self.root.as_ref().unwrap().borrow_mut();
+        let tree_depth = root.compile_tree();
+        drop(root);
+        let root = self.root.as_ref().unwrap().borrow();
 
         for proc_rc in self.active_procs.values() {
             let proc = proc_rc.borrow();
-            procs_by_cmd.entry(proc.argv[0].clone()).or_default().push(proc_rc.clone());
+            proc_groups.entry(proc.argv[0].clone()).or_default().add(proc_rc.clone());
             error!("Active process #{} {} pid={} has {} active threads: {}",
                 proc.ordinal, proc.argv[0], proc.pid, proc.active_threads.len(),
                      proc.active_threads.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
         }
 
         let mut total_cpu_time = Duration::zero();
-        let total_elapsed = Utc::now() - self.finished_procs[0].borrow().start_time;
+        let total_elapsed = Utc::now() - root.start_time;
 
-        let mut root = None;
         let mut orphans = Vec::new();
         for proc_rc in &self.finished_procs {
             let proc = proc_rc.borrow();
-            procs_by_cmd.entry(proc.argv[0].clone()).or_default().push(proc_rc.clone());
-            total_cpu_time += proc.cpu_time;
-            if proc.ordinal == 1 {
-                root = Some(proc_rc.clone());
-            } else if proc.parent.is_none() {
+            proc_groups.entry(proc.argv[0].clone()).or_default().add(proc_rc.clone());
+            total_cpu_time += proc.self_cpu_time;
+            if proc.ordinal != 1 && proc.parent.is_none() {
+                error!("process without parent: #{} {}", proc.ordinal, proc.pid);
                 orphans.push(proc_rc.clone());
             }
         }
-        let root = root.as_ref().unwrap().borrow();
-        let tree_depth = root.tree_depth();
         let mut postfix = "  ".repeat(tree_depth + 1);
 
-        self.print_tree(&root, &mut String::new(), &mut postfix, true, true);
+        self.print_tree(output, &root, &mut String::new(), &mut postfix, true, true);
         for (num, orphan) in orphans.iter().enumerate() {
             let orphan = orphan.borrow();
-            error!("process without parent: #{} {}", orphan.ordinal, orphan.pid);
-            self.print_tree(&orphan, &mut String::from("  "), &mut postfix, num == orphans.len() - 1, false);
+            self.print_tree(output, &orphan, &mut String::from("  "), &mut postfix, num == orphans.len() - 1, false);
         }
 
-        if procs_by_cmd.values().any(|procs| procs.len() >= 3) {
-            println!("\nGroup by command:");
-            for (name, procs) in procs_by_cmd {
-                let mut cmd_cpu_time = Duration::zero();
-                let mut cmd_elapsed = Duration::zero();
-                for proc_rc in &procs {
-                    let proc = proc_rc.borrow();
-                    cmd_elapsed += proc.elapsed();
-                    cmd_cpu_time += proc.cpu_time;
-                }
-                println!("{:>9.3}s {:>7.1}%cpu {:>5} processes  {name}",
-                    cmd_cpu_time.as_seconds_f64(),
-                    100.0 * cmd_cpu_time.as_seconds_f64() / cmd_elapsed.as_seconds_f64(),
-                    procs.len(),
-                );
+        if proc_groups.values().any(|group| group.num_procs >= 3) {
+            writeln!(output, "\nGroup by command:").expect("Failed to write to output");
+            let mut proc_groups = proc_groups.iter().collect::<Vec<_>>();
+            proc_groups.sort_by_key(|(_, group)| group.total_self_cpu_time);
+            for (name, group) in proc_groups {
+                writeln!(output, "{:>9.3}s {:>7.1}%cpu  [tree: {:7.1}%cpu] {:>5} processes  {name}",
+                         group.total_self_cpu_time.as_seconds_f64(),
+                         100.0 * group.total_self_cpu_time.as_seconds_f64() / group.total_elapsed.as_seconds_f64(),
+                         100.0 * group.total_tree_cpu_time.as_seconds_f64() / group.total_elapsed.as_seconds_f64(),
+                         group.num_procs,
+                ).expect("Failed to write to output");
             }
         }
 
-
-        println!("{}: {} processes {:7.3}s {:7.1}%cpu",
+        writeln!(output, "{}: {} processes {:7.3}s {:7.1}%cpu",
             root.argv[0],
             self.finished_procs.len(),
             total_elapsed.as_seconds_f64(),
-            100.0 * total_cpu_time.as_seconds_f64() / total_elapsed.as_seconds_f64());
+            100.0 * total_cpu_time.as_seconds_f64() / total_elapsed.as_seconds_f64()
+        ).expect("Failed to write to output");
     }
 }

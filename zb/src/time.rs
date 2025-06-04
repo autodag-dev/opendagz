@@ -2,16 +2,11 @@ use nix::sys::ptrace;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
 use std::ffi::CString;
-use std::{process};
+use std::{io, process};
 use std::fs::File;
 use nix::libc;
-use tracing::{debug, error, trace, Level};
-//use tracing_subscriber::filter::LevelFilter;
-//use tracing_subscriber::fmt::writer::MakeWriterExt;
-//use tracing_subscriber::layer::SubscriberExt;
-//use tracing_subscriber::util::SubscriberInitExt;
+use tracing::{debug, error, trace};
 use tracing_subscriber::{fmt, prelude::*, filter::LevelFilter};
-use tracing_subscriber::fmt::{writer::MakeWriterExt};
 use crate::thread_monitor::{ProcessEndReason, ThreadMonitor};
 
 #[derive(clap::Args)]
@@ -26,6 +21,9 @@ pub(crate) struct TimeCommand {
 
     #[arg(long, help = "Debug log file")]
     log: Option<String>,
+    
+    #[arg(short, long, help = "Write output to file instead of stdout")]
+    output: Option<String>,
 
     /// Command and arguments to time
     #[arg(trailing_var_arg = true, required = true)]
@@ -33,16 +31,6 @@ pub(crate) struct TimeCommand {
 }
 
 impl TimeCommand {
-    fn cont(&self, pid: Pid) {
-        ptrace::cont(pid, None).unwrap_or_else(|e| {
-            if e != nix::Error::ESRCH {
-                debug!("Process {} already exited, cannot continue", pid);
-            } else {
-                error!("Failed to continue process {}: {}", pid, e);
-            }
-        });
-    }
-    
     pub(crate) fn run_impl(&self) -> Result<(), nix::Error> {
         // use nix to create a child process
         let root_pid = match unsafe { nix::unistd::fork()? } {
@@ -86,7 +74,14 @@ impl TimeCommand {
                 }
                 Ok(WaitStatus::PtraceEvent(parent_tid, _signal, event)) => {
                     let event_data = ptrace::getevent(parent_tid);
-                    self.cont(parent_tid);
+                    ptrace::cont(parent_tid, None).unwrap_or_else(|e| {
+                        if e != nix::Error::ESRCH {
+                            debug!("Process {} already exited, cannot continue", parent_tid);
+                        } else {
+                            error!("Failed to continue process {}: {}", parent_tid, e);
+                        }
+                    });
+
                     trace!("waitpid result: {:?} data={}", wait_result, event_data.unwrap_or(-1));
                     match event {
                         libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
@@ -111,7 +106,7 @@ impl TimeCommand {
                                         .split('\0')
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>();
-                                    monitor.start_proc(parent_tid, argv, Some(prev_tid));
+                                    monitor.handle_exec(parent_tid, argv, Some(prev_tid));
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -151,9 +146,17 @@ impl TimeCommand {
                         .unwrap_or_else(|e| {
                             error!("Failed to set ptrace options for child process {}: {}", pid, e)
                         });
-                        monitor.start_proc(pid, self.args.clone(), None);
+                        monitor.handle_exec(pid, self.args.clone(), None);
                     }
-                    self.cont(pid);
+
+                    let cont_signal = if signal == nix::sys::signal::SIGTRAP { None } else { Some(signal) };
+                    ptrace::cont(pid, cont_signal).unwrap_or_else(|e| {
+                        if e != nix::Error::ESRCH {
+                            debug!("Process {} already exited, cannot continue", pid);
+                        } else {
+                            error!("Failed to continue process {}: {}", pid, e);
+                        }
+                    });
                     if signal != nix::sys::signal::SIGUSR1 {
                         trace!("thread {} stop with signal {}", pid, signal);
                     }
@@ -174,13 +177,17 @@ impl TimeCommand {
             }
         }
 
-        monitor.report();
+        if let Some(output) = &self.output {
+            monitor.report(&mut File::create(output).expect("Failed to create output file"));
+        } else {
+            monitor.report(&mut io::stdout());
+        };
         process::exit(root_exit_code.unwrap_or(2));
     }
 
     pub(crate) fn run(&self) {
         let console_layer = fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(io::stderr)
             .with_ansi(true)
             .with_filter(LevelFilter::WARN);
 
