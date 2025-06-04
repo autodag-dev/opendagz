@@ -1,13 +1,15 @@
 use nix::sys::ptrace;
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
+use nix::sys::wait::{WaitStatus};
 use nix::unistd::{ForkResult, Pid};
 use std::ffi::CString;
-use std::{io, process};
+use std::{io, mem, process};
 use std::fs::File;
+use std::time::Instant;
+use nix::errno::Errno;
 use nix::libc;
 use tracing::{debug, error, trace};
 use tracing_subscriber::{fmt, prelude::*, filter::LevelFilter};
-use crate::thread_monitor::{ProcessEndReason, ThreadMonitor};
+use crate::thread_monitor::{ProcessEnd, ProcessEndReason, ThreadMonitor};
 
 #[derive(clap::Args)]
 pub(crate) struct TimeCommand {
@@ -30,6 +32,8 @@ pub(crate) struct TimeCommand {
     args: Vec<String>,
 }
 
+
+
 impl TimeCommand {
     pub(crate) fn run_impl(&self) -> Result<(), nix::Error> {
         // use nix to create a child process
@@ -50,18 +54,37 @@ impl TimeCommand {
 
         let mut monitor = ThreadMonitor::new();
         let mut root_exit_code = None;
+        let mut deadline = None;
 
         loop {
-            let wait_result = nix::sys::wait::waitpid(None, WaitPidFlag::__WALL.into());
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    error!("Timeout reached after command exit, some processes may still be running");
+                    break;
+                }
+            }
+            let (wait_result, rusage) = unsafe {
+                let mut status: libc::c_int = 0;
+                let mut rusage: libc::rusage = mem::zeroed();
+                let res = libc::wait4(-1 as libc::pid_t, &mut status, libc::__WALL, &mut rusage);
+
+                (match Errno::result(res) {
+                    Ok(0) => Ok(WaitStatus::StillAlive),
+                    Ok(res) => WaitStatus::from_raw(Pid::from_raw(res), status),
+                    Err(e) => Err(e),
+                }, rusage)
+            };
+
             match wait_result {
                 Ok(WaitStatus::Exited(tid, status)) => {
                     trace!("waitpid result exit: {:?}", wait_result);
-                    monitor.finish_thread(tid, ProcessEndReason::LateExitCode(status));
+                    monitor.finish_thread(tid, ProcessEnd::from_rusage(ProcessEndReason::LateExitCode(status), &rusage));
                     if monitor.active_procs.is_empty() {
                         debug!("all child processes have exited, expecting last wait");
                     }
                     if tid == root_pid {
                         root_exit_code = Some(status);
+                        deadline = Some(Instant::now() + std::time::Duration::from_millis(200));
                     }
                 }
                 Ok(WaitStatus::Signaled(_pid, _signal, _)) => {
@@ -106,7 +129,10 @@ impl TimeCommand {
                                         .split('\0')
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>();
-                                    monitor.handle_exec(parent_tid, argv, Some(prev_tid));
+                                    monitor.handle_exec(parent_tid, argv, Some(prev_tid), ProcessEnd::from_rusage(
+                                        ProcessEndReason::Exec,
+                                        &rusage,
+                                    ));
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -116,7 +142,8 @@ impl TimeCommand {
                         libc::PTRACE_EVENT_EXIT => {
                             match event_data {
                                 Ok(exit_code) => {
-                                    monitor.finish_thread(parent_tid, ProcessEndReason::ExitCode(exit_code as i32 >> 8));
+                                    monitor.finish_thread(parent_tid, ProcessEnd::from_rusage(
+                                        ProcessEndReason::ExitCode(exit_code as i32 >> 8), &rusage));
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -146,7 +173,8 @@ impl TimeCommand {
                         .unwrap_or_else(|e| {
                             error!("Failed to set ptrace options for child process {}: {}", pid, e)
                         });
-                        monitor.handle_exec(pid, self.args.clone(), None);
+                        monitor.handle_exec(pid, self.args.clone(), None,
+                            ProcessEnd::from_rusage(ProcessEndReason::Exec, &rusage));
                     }
 
                     let cont_signal = if signal == nix::sys::signal::SIGTRAP { None } else { Some(signal) };
@@ -165,7 +193,7 @@ impl TimeCommand {
                     error!("unexpected waitpid event {:?}", wait_result);
                 }
                 Err(e) => {
-                    if e == nix::errno::Errno::ECHILD {
+                    if e == Errno::ECHILD {
                         // No more child processes
                         debug!("waitpid: No more child processes");
                     } else {
@@ -191,8 +219,7 @@ impl TimeCommand {
             .with_ansi(true)
             .with_filter(LevelFilter::WARN);
 
-        let tracing_builder = tracing_subscriber::registry()
-            .with(console_layer);
+        let tracing_builder = tracing_subscriber::registry().with(console_layer);
 
         if let Some(log) = &self.log {
             let file_layer = tracing_subscriber::fmt::layer()

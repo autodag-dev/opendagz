@@ -1,13 +1,14 @@
 use std::collections::{hash_map, HashMap, HashSet};
-use std::{fs, io, mem};
+use std::{io, mem};
 use std::cell::RefCell;
 use std::io::stdout;
 use std::os::fd::{AsFd};
 use std::rc::Rc;
-use chrono::{DateTime, Duration, Utc};
+use std::time::{Duration, Instant};
 use nix::unistd::Pid;
 use tracing::{debug, error, trace};
 use colored::Colorize;
+use nix::libc;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ProcessEndReason {
@@ -17,8 +18,30 @@ pub(crate) enum ProcessEndReason {
     Exec
 }
 
-struct ProcessEnd {
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessEnd {
+    max_rss_kb: i64,
+    iops: i64,
+    ucpu: Duration,
+    kcpu: Duration,
+    
     reason: ProcessEndReason,
+}
+
+fn timeval_to_duration(tv: &libc::timeval) -> Duration {
+    Duration::new(tv.tv_sec as u64, (tv.tv_usec * 1000) as u32)
+}
+
+impl ProcessEnd {
+    pub(crate) fn from_rusage(reason: ProcessEndReason, rusage: &libc::rusage) -> Self {
+        Self {
+            max_rss_kb: rusage.ru_maxrss,
+            ucpu: timeval_to_duration(&rusage.ru_utime),
+            kcpu: timeval_to_duration(&rusage.ru_stime),
+            iops: rusage.ru_inblock + rusage.ru_oublock,
+            reason,
+        }
+    }
 }
 
 pub(crate) struct ProcessSpan {
@@ -26,7 +49,10 @@ pub(crate) struct ProcessSpan {
     ordinal: usize,
     pid: Pid,
     argv: Vec<String>,
-    start_time: DateTime<Utc>,
+    start_time: Instant,
+    
+    /// Used to deduct initial counters not reset after execve()
+    initial_usage: ProcessEnd,
 
     // Relations
     parent: Option<Rc<RefCell<ProcessSpan>>>,
@@ -35,10 +61,18 @@ pub(crate) struct ProcessSpan {
 
     // Accumulators
     total_threads: usize,
-    self_cpu_time: Duration,
+    
+    /// Tree-cpu is what we get from wait4().  
     tree_cpu_time: Duration,
+    
+    /// Calculated by subtracting all children tree_cpu_time from self.tree_cpu_time.
+    self_cpu_time: Duration,
+    
+    /// Total durations of all threads and forked processes (until execve() calls).
     self_elapsed: Duration,
-    tree_end_time: DateTime<Utc>,
+
+    /// Time of last ended thread.
+    tree_end_time: Instant,
     end: Option<ProcessEnd>,
 }
 
@@ -49,23 +83,22 @@ impl ProcessSpan {
 
     fn compile_tree(&mut self) -> usize {
         let mut depth = 0;
-        let mut total_cpu = self.self_cpu_time;
+        self.tree_cpu_time -= self.initial_usage.ucpu + self.initial_usage.kcpu;
+        self.self_cpu_time = self.tree_cpu_time; // reset self_cpu_time to tree_cpu_time for the root process
         for child in &self.children {
             let mut child = child.borrow_mut();
             let child_depth = child.compile_tree();
-            total_cpu += child.tree_cpu_time;
             depth = depth.max(1 + child_depth);
             self.tree_end_time = self.tree_end_time.max(child.tree_end_time);
+            self.self_cpu_time = self.self_cpu_time.saturating_sub(child.tree_cpu_time);
         }
-        self.tree_cpu_time = total_cpu;
         depth
     }
 }
 
 struct ThreadSpan {
     proc: Option<Rc<RefCell<ProcessSpan>>>,
-    start_time: DateTime<Utc>,
-    last_cpu_time: Duration,
+    start_time: Instant,
     unbound_child_tids: Vec<Pid>,
 
     /// for execing threads, the associated proces if no ppid is known during exec
@@ -74,31 +107,32 @@ struct ThreadSpan {
     /// Threads born without parent will be kept in active threads even after they have finished.
     born_orphan: bool,
 
-    end_reason: Option<ProcessEndReason>,
+    end: Option<ProcessEnd>,
 }
 
 impl ThreadSpan {
     fn new_orphan() -> Self {
         Self {
             proc: None,
-            start_time: Utc::now(),
-            last_cpu_time: Default::default(),
+            start_time: Instant::now(),
             unbound_child_tids: Default::default(),
             orphan_proc: None,
             born_orphan: true,
-            end_reason: None,
+            end: None,
         }
     }
 
-    fn with_end_reason(mut self, proc_end: ProcessEndReason) -> Self {
-        self.end_reason = Some(proc_end);
+    fn with_end(mut self, proc_end: ProcessEnd) -> Self {
+        self.end = Some(proc_end);
         self
     }
 }
 
 #[derive(Default)]
 struct ProcessGroup {
-    num_procs: usize,
+    num_execs: usize,
+    total_rss_kb: i64,
+    max_rss_kb: i64,
     total_elapsed: Duration,
     total_self_cpu_time: Duration,
     total_tree_cpu_time: Duration,
@@ -107,7 +141,10 @@ struct ProcessGroup {
 impl ProcessGroup {
     fn add(&mut self, proc: Rc<RefCell<ProcessSpan>>) {
         let proc = proc.borrow();
-        self.num_procs += 1;
+        let rss_kb = if let Some(end) = proc.end.as_ref() { end.max_rss_kb } else { 0 };
+        self.num_execs += 1;
+        self.total_rss_kb += rss_kb;
+        self.max_rss_kb = self.max_rss_kb.max(rss_kb);
         self.total_elapsed += proc.elapsed();
         self.total_self_cpu_time += proc.self_cpu_time;
         self.total_tree_cpu_time += proc.tree_cpu_time;
@@ -117,7 +154,6 @@ impl ProcessGroup {
 
 #[derive(Default)]
 pub(crate) struct ThreadMonitor {
-    page_size_kb: i64,
     ticks_per_sec: f64,
     have_schedstats: bool,
     is_tty: bool,
@@ -130,14 +166,14 @@ pub(crate) struct ThreadMonitor {
 
 impl ThreadMonitor {
     pub(crate) fn new() -> Self {
-        let page_size_kb = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap().unwrap() as i64 / 1024;
+        //let page_size_kb = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap().unwrap() as i64 / 1024;
         let ticks_per_sec = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK).unwrap().unwrap() as f64;
-        let have_schedstats = fs::exists("/proc/self/schedstat").unwrap_or(false);
+        //let have_schedstats = fs::exists("/proc/self/schedstat").unwrap_or(false);
         let is_tty = nix::unistd::isatty(stdout().as_fd()).unwrap_or(false);
         Self {
             ticks_per_sec,
-            page_size_kb,
-            have_schedstats,
+            //page_size_kb,
+            //have_schedstats,
             is_tty,
             ..Default::default()
         }
@@ -178,7 +214,7 @@ impl ThreadMonitor {
 
         let mut proc = proc_rc.borrow_mut();
         proc.total_threads += 1;
-        if thread.end_reason.is_none() {
+        if thread.end.is_none() {
             proc.active_threads.insert(tid);
             thread.proc = Some(proc_rc.clone());
             trace!("Process #{} {} bound to thread {}, active={}",
@@ -197,7 +233,7 @@ impl ThreadMonitor {
         }
     }
 
-    fn unbind_tid(&mut self, tid: Pid, reason: ProcessEndReason) -> Option<Rc<RefCell<ProcessSpan>>> {
+    fn unbind_tid(&mut self, tid: Pid, end: ProcessEnd) -> Option<Rc<RefCell<ProcessSpan>>> {
         let thread = match self.active_threads.get_mut(&tid) {
             Some(thread) => thread,
             None => {
@@ -213,63 +249,26 @@ impl ThreadMonitor {
             return None;
         };
 
-        let end_time = Utc::now();
-        let cpu_time = if self.have_schedstats {
-            let filename = format!("/proc/{}/task/{}/schedstat", tid, tid);
-            match fs::read_to_string(&filename) {
-                Ok(proc_stat) => {
-                    let parts: Vec<&str> = proc_stat.split_whitespace().collect();
-                    Duration::nanoseconds(parts[0].parse::<i64>().unwrap_or(0))
-                },
-                Err(e) => {
-                    if !matches!(reason, ProcessEndReason::LateExitCode(_)) {
-                        // late exit event happens *after* the thread has exited, so we cannot really expect the file to exist
-                        error!("Failed to read {}: {}", filename, e);
-                    }
-                    Duration::zero()
-                },
-            }
-        } else {
-            let filename = format!("/proc/{}/stat", tid);
-            match fs::read_to_string(&filename) {
-                Ok(proc_stat) => {
-                    let post_parens = proc_stat.split_once(')').unwrap().1;
-                    let parts: Vec<&str> = post_parens.split_whitespace().collect();
-                    let user_time = parts[11].parse::<i64>().unwrap_or(0);
-                    let sys_time = parts[12].parse::<i64>().unwrap_or(0);
-                    Duration::milliseconds((1000.0 * (user_time + sys_time) as f64 / self.ticks_per_sec) as i64)
-                },
-                Err(e) => {
-                    if !matches!(reason, ProcessEndReason::LateExitCode(_)) {
-                        // late exit event happens *after* the thread has exited, so we cannot really expect the file to exist
-                        error!("Failed to read {}: {}", filename, e);
-                    }
-                    Duration::zero()
-                },
-            }
-        };
+        let end_time = Instant::now();
         let mut proc = proc_rc.borrow_mut();
         proc.self_elapsed += end_time - thread.start_time;
-        proc.self_cpu_time += cpu_time - thread.last_cpu_time;
+        proc.tree_cpu_time = end.ucpu + end.kcpu;
         proc.tree_end_time = proc.tree_end_time.max(end_time);
 
         thread.start_time = end_time;
-        thread.last_cpu_time = cpu_time;
         proc.active_threads.remove(&tid);
 
         let proc_pid = proc.pid;
         if proc.active_threads.is_empty() {
             debug!("Process #{} {} pid={} finished by {:?}",
-                proc.ordinal, proc.argv[0], proc.pid, reason);
+                proc.ordinal, proc.argv[0], proc.pid, end.reason);
 
             self.active_procs.remove(&proc_pid).unwrap();
-            proc.end = Some(ProcessEnd {
-                reason,
-            });
+            proc.end = Some(end);
             self.finished_procs.push(proc_rc.clone());
         } else {
             trace!("Unbound thread {} from process #{} {} due to {:?}, active={}",
-                tid, proc.ordinal, proc.pid, reason, proc.active_threads.len());
+                tid, proc.ordinal, proc.pid, end.reason, proc.active_threads.len());
         }
 
         drop(proc);
@@ -296,14 +295,14 @@ impl ThreadMonitor {
         }
     }
 
-    pub(crate) fn handle_exec(&mut self, pid: Pid, argv: Vec<String>, prev_tid: Option<Pid>) {
-        let start_time = Utc::now();
+    pub(crate) fn handle_exec(&mut self, pid: Pid, argv: Vec<String>, prev_tid: Option<Pid>, end: ProcessEnd) {
+        let start_time = Instant::now();
         let mut born_orphan = false;
         let mut parent_proc = None;
         if let Some(prev_tid) = prev_tid {
             if let Some(_parent_thread) = self.active_threads.get(&prev_tid) {
                 trace!("Finishing previous process thread {} before new process {}", prev_tid, pid);
-                parent_proc = self.unbind_tid(prev_tid, ProcessEndReason::Exec);
+                parent_proc = self.unbind_tid(prev_tid, end.clone());
             } else {
                 debug!("execing tid {} not found in active threads, born orphan; new pid={} exists={}",
                     prev_tid, pid, self.active_threads.contains_key(&pid));
@@ -323,6 +322,7 @@ impl ThreadMonitor {
             total_threads: 0,
             active_threads: Default::default(),
             start_time,
+            initial_usage: end,
             self_cpu_time: Default::default(),
             tree_cpu_time: Default::default(),
             self_elapsed: Default::default(),
@@ -343,19 +343,18 @@ impl ThreadMonitor {
             start_time,
             born_orphan,
             unbound_child_tids: Default::default(),
-            end_reason: None,
+            end: None,
             orphan_proc: if born_orphan { Some(new_proc.clone()) } else { None },
-            last_cpu_time: Default::default(),
         });
         self.active_procs.insert(pid, new_proc);
 
         self.bind_tid(pid, pid);
     }
 
-    pub(crate) fn finish_thread(&mut self, tid: Pid, proc_end: ProcessEndReason) -> Option<Rc<RefCell<ProcessSpan>>> {
+    pub(crate) fn finish_thread(&mut self, tid: Pid, proc_end: ProcessEnd) -> Option<Rc<RefCell<ProcessSpan>>> {
         let finished_proc = self.unbind_tid(tid, proc_end.clone());
         if let Some(finished_proc) = &finished_proc {
-            if matches!(&proc_end, ProcessEndReason::LateExitCode(_)) {
+            if matches!(proc_end.reason, ProcessEndReason::LateExitCode(_)) {
                 debug!("finished thread without exit event: {} pid={}", tid, finished_proc.borrow().pid);
             }
         }
@@ -364,14 +363,14 @@ impl ThreadMonitor {
                 let thread = entry.get_mut();
                 if thread.born_orphan {
                     debug!("Thread {tid} born orphan, left in active threads");
-                    thread.end_reason = Some(proc_end);
+                    thread.end = Some(proc_end);
                 } else {
                     entry.remove();
                 }
             },
             hash_map::Entry::Vacant(entry) => {
                 debug!("Finished thread {} died orphan, end={:?}", tid, proc_end);
-                entry.insert(ThreadSpan::new_orphan().with_end_reason(proc_end));
+                entry.insert(ThreadSpan::new_orphan().with_end(proc_end));
             }
         }
 
@@ -381,14 +380,15 @@ impl ThreadMonitor {
     fn print_tree(&self, output: &mut dyn io::Write, proc: &ProcessSpan, indent: &mut String, postfix: &mut String, last: bool, is_root: bool) {
         let proc_end = proc.end.as_ref().unwrap();
         let elapsed = proc.elapsed();
-        let cpu_pct = 100.0 * proc.self_cpu_time.as_seconds_f64() / elapsed.as_seconds_f64();
         let connector = if is_root { "" } else if last { "└─" } else { "├─" };
 
         let argv_cutoff = if self.is_tty { 100 } else { 0 };
-        writeln!(output, "{indent}{connector}{:<5}{postfix} {:9.3}s {:7.1}%cpu {:>4} threads {:>8} {:.argv_cutoff$}",
+        writeln!(output, "{indent}{connector}{:<5}{postfix} {:9.3}s {:7.1}%cpu {:4} MB (tree: {:7.1}%cpu) {:>4} threads {:>8} {:.argv_cutoff$}",
              format!("#{}", proc.ordinal),
-             elapsed.as_seconds_f64(),
-             cpu_pct,
+             elapsed.as_secs_f64(),
+             100.0 * proc.self_cpu_time.as_secs_f64() / elapsed.as_secs_f64(),
+             proc_end.max_rss_kb / 1024,
+             100.0 * proc.tree_cpu_time.as_secs_f64() / elapsed.as_secs_f64(),
              proc.total_threads,
              match proc_end.reason {
                  ProcessEndReason::ExitCode(code) | ProcessEndReason::LateExitCode(code) => {
@@ -430,8 +430,8 @@ impl ThreadMonitor {
                      proc.active_threads.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
         }
 
-        let mut total_cpu_time = Duration::zero();
-        let total_elapsed = Utc::now() - root.start_time;
+        let mut total_cpu_time = Duration::default();
+        let total_elapsed = Instant::now() - root.start_time;
 
         let mut orphans = Vec::new();
         for proc_rc in &self.finished_procs {
@@ -451,16 +451,18 @@ impl ThreadMonitor {
             self.print_tree(output, &orphan, &mut String::from("  "), &mut postfix, num == orphans.len() - 1, false);
         }
 
-        if proc_groups.values().any(|group| group.num_procs >= 3) {
+        if proc_groups.values().any(|group| group.num_execs >= 3) {
             writeln!(output, "\nGroup by command:").expect("Failed to write to output");
             let mut proc_groups = proc_groups.iter().collect::<Vec<_>>();
             proc_groups.sort_by_key(|(_, group)| group.total_self_cpu_time);
             for (name, group) in proc_groups {
-                writeln!(output, "{:>9.3}s {:>7.1}%cpu  [tree: {:7.1}%cpu] {:>5} processes  {name}",
-                         group.total_self_cpu_time.as_seconds_f64(),
-                         100.0 * group.total_self_cpu_time.as_seconds_f64() / group.total_elapsed.as_seconds_f64(),
-                         100.0 * group.total_tree_cpu_time.as_seconds_f64() / group.total_elapsed.as_seconds_f64(),
-                         group.num_procs,
+                writeln!(output, "{:>9.3}s {:>7.1}%cpu {:4} MB avg {:4} MB max (tree: {:7.1}%cpu) {:>5} execs  {name}",
+                    group.total_self_cpu_time.as_secs_f64(),
+                    100.0 * group.total_self_cpu_time.as_secs_f64() / group.total_elapsed.as_secs_f64(),
+                    group.total_rss_kb / 1024 / group.num_execs as i64,
+                    group.max_rss_kb / 1024,
+                    100.0 * group.total_tree_cpu_time.as_secs_f64() / group.total_elapsed.as_secs_f64(),
+                    group.num_execs,
                 ).expect("Failed to write to output");
             }
         }
@@ -468,8 +470,8 @@ impl ThreadMonitor {
         writeln!(output, "{}: {} processes {:7.3}s {:7.1}%cpu",
             root.argv[0],
             self.finished_procs.len(),
-            total_elapsed.as_seconds_f64(),
-            100.0 * total_cpu_time.as_seconds_f64() / total_elapsed.as_seconds_f64()
+            total_elapsed.as_secs_f64(),
+            100.0 * total_cpu_time.as_secs_f64() / total_elapsed.as_secs_f64()
         ).expect("Failed to write to output");
     }
 }
