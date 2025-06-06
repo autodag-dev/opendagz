@@ -2,7 +2,7 @@
 color = "always"
 
 [target.'cfg(target_os = "linux")']
-rustflags = ["-C", "prefer-dynamic=no", "-C", "link-args=-Wl,-fuse-ld=mold"]
+rustflags = ["-C", "prefer-dynamic=no"]
 
 [target.'cfg(target_os = "macos")']
 rustflags = ["-C", "prefer-dynamic=no", "-C", "link-args=-Wl,-rpath,@loader_path"]

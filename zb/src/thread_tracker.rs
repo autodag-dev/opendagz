@@ -7,7 +7,6 @@ use chrono::TimeDelta;
 use nix::unistd::Pid;
 use nix::libc;
 use tracing::{debug, error, trace};
-use crate::DagzCommands::Time;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ProcessEndReason {
@@ -20,29 +19,22 @@ pub(crate) enum ProcessEndReason {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ResourceUsage {
     pub(crate) max_rss_kb: i64,
-    pub(crate) ucpu: chrono::TimeDelta,
-    kcpu: chrono::TimeDelta,
+    pub(crate) ucpu: TimeDelta,
+    kcpu: TimeDelta,
     iops: i64,
     pub(crate) threads: i64,
 }
 
 impl ResourceUsage {
-    pub(crate) fn set_max(&mut self, other: &ResourceUsage) {
-        self.ucpu = self.ucpu.max(other.ucpu);
-        self.kcpu = self.kcpu.max(other.kcpu);
-        self.iops = self.iops.max(other.iops);
-    }
-}
-
-impl ResourceUsage {
-    pub(crate) fn cpu(&self) -> chrono::TimeDelta {
+    pub(crate) fn cpu(&self) -> TimeDelta {
         self.ucpu + self.kcpu
     }
 
     pub(crate) fn sub(&mut self, other: &ResourceUsage) {
         self.ucpu -= other.ucpu;
         self.kcpu -= other.kcpu;
-        self.iops -= other.iops
+        self.iops -= other.iops;
+        self.threads -= other.threads;
     }
 
     pub(crate) fn add(&mut self, other: &ResourceUsage) {
@@ -50,12 +42,13 @@ impl ResourceUsage {
         self.ucpu += other.ucpu;
         self.kcpu += other.kcpu;
         self.iops += other.iops;
+        self.threads += other.threads;
     }
 }
 
 
-fn timeval_to_duration(tv: &libc::timeval) -> chrono::TimeDelta {
-    chrono::TimeDelta::new(tv.tv_sec, (tv.tv_usec * 1000) as u32).unwrap()
+fn timeval_to_duration(tv: &libc::timeval) -> TimeDelta {
+    TimeDelta::new(tv.tv_sec, (tv.tv_usec * 1000) as u32).unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +99,7 @@ pub(crate) struct ThreadSpan {
     pub(crate) end: Option<ThreadEnd>,
 
     pub(crate) tree_usage: ResourceUsage,
-    pub(crate) children_usage: ResourceUsage,
+    pub(crate) cmd_usage: ResourceUsage,
     pub(crate) tree_end_time: Instant,
 }
 
@@ -123,51 +116,47 @@ impl ThreadSpan {
             end: None,
             children: Default::default(),
             tree_usage: Default::default(),
-            children_usage: Default::default(),
+            cmd_usage: Default::default(),
             tree_end_time: now,
         }
     }
 
     pub(crate) fn compile_tree(&mut self, nest_level: usize) {
         let end = self.end.as_mut().unwrap();
-        self.tree_usage = end.usage.clone();
+        self.cmd_usage = end.usage.clone();
         if let Some(initial) = &self.initial_usage {
-            self.tree_usage.sub(initial);
+            self.cmd_usage.sub(initial);
         }
 
+        self.tree_usage = self.cmd_usage.clone();
         self.tree_end_time = end.time;
         self.tree_usage.threads = 1;
         for child in &self.children {
             let mut child = child.borrow_mut();
             child.compile_tree(nest_level + 1);
+            self.tree_usage.add(&child.tree_usage);
             match &child.init {
                 ThreadInit::Exec(_) => {
                     // add usage from this sub-commands
-                    self.children_usage.add(&child.tree_usage);
+                    //self.tree_usage.add(&child.tree_usage);
                 },
                 ThreadInit::Forked | ThreadInit::Thread => {
                     // add usage only from sub-commands (recursively)
-                    self.children_usage.add(&child.children_usage);
-                    self.tree_usage.threads += child.tree_usage.threads;
-
-                    self.tree_end_time = self.tree_end_time.max(child.tree_end_time);
+                    self.cmd_usage.add(&child.cmd_usage);
                 }
                 ThreadInit::Unknown => {
                     error!("Unknown thread: #{} {}", self.ordinal, self.tid);
                 }
             }
-
-            // sometimes threads are not waited for, and thus the main thread's rusage is not accumulated.
-            // we ensure that the parent's usage is always at least as the last child's usage.
-            self.tree_usage.set_max(&child.tree_usage);
+            self.tree_end_time = self.tree_end_time.max(child.tree_end_time);
         }
         let indent = "  ".repeat(nest_level);
-        trace!("{:2} {indent}thread #{} {} initial={:.0} end={:.0} tree_cpu={:.0} child_cpu={:.0}  kind={:?}",
+        trace!("{:2} {indent}thread #{} {} initial={:.0} end={:.0} cmd_cpu={:.0} tree_cpu={:.0}  kind={:?}",
             nest_level, self.ordinal, self.tid,
             if let Some(initial) = &self.initial_usage { initial.cpu().as_seconds_f64()*1000.0 } else { 0.0 },
             if let Some(end) = &self.end { end.usage.cpu().as_seconds_f64()*1000.0 } else { 0.0 },
+            self.cmd_usage.cpu().as_seconds_f64() * 1000.0,
             self.tree_usage.cpu().as_seconds_f64() * 1000.0,
-            self.children_usage.cpu().as_seconds_f64() * 1000.0,
             self.init,
         );
     }
@@ -228,16 +217,17 @@ impl ThreadTracker {
         }).clone()
     }
 
-    fn get_cpu_usage(&self, thread: &ThreadSpan, reason: ProcessEndReason) -> TimeDelta {
-        if self.have_schedstats {
-            let filename = format!("/proc/{}/task/{}/schedstat", thread.tid, thread.tid);
+    fn update_usage(&self, tid: Pid, status: &mut ThreadEnd) {
+        status.usage.kcpu = TimeDelta::zero();
+        status.usage.ucpu = if self.have_schedstats {
+            let filename = format!("/proc/{}/task/{}/schedstat", tid, tid);
             match fs::read_to_string(&filename) {
                 Ok(proc_stat) => {
                     let parts: Vec<&str> = proc_stat.split_whitespace().collect();
                     TimeDelta::nanoseconds(parts[0].parse::<i64>().unwrap_or(0))
                 },
                 Err(e) => {
-                    if !matches!(reason, ProcessEndReason::LateExitCode(_)) {
+                    if !matches!(status.reason, ProcessEndReason::LateExitCode(_)) {
                         // late exit event happens *after* the thread has exited, so we cannot really expect the file to exist
                         error!("Failed to read {}: {}", filename, e);
                     }
@@ -245,7 +235,7 @@ impl ThreadTracker {
                 }
             }
         } else {
-            let filename = format!("/proc/{}/stat", thread.tid);
+            let filename = format!("/proc/{}/task/{}/stat", tid, tid);
             match fs::read_to_string(&filename) {
                 Ok(proc_stat) => {
                     let post_parens = proc_stat.split_once(')').unwrap().1;
@@ -255,14 +245,14 @@ impl ThreadTracker {
                     TimeDelta::milliseconds((1000.0 * (user_time + sys_time) as f64 / self.ticks_per_sec) as i64)
                 },
                 Err(e) => {
-                    if !matches!(reason, ProcessEndReason::LateExitCode(_)) {
+                    if !matches!(status.reason, ProcessEndReason::LateExitCode(_)) {
                         // late exit event happens *after* the thread has exited, so we cannot really expect the file to exist
                         error!("Failed to read {}: {}", filename, e);
                     }
                     TimeDelta::zero()
                 },
             }
-        }
+        };
     }
 
     pub(crate) fn handle_spawn(&mut self, tid: Pid, parent_tid: Pid, is_fork: bool) {
@@ -279,11 +269,12 @@ impl ThreadTracker {
         parent.borrow_mut().children.push(thread.clone());
     }
 
-    pub(crate) fn handle_exec(&mut self, pid: Pid, argv: Vec<String>, prev_tid: Option<Pid>, end: ThreadEnd) {
+    pub(crate) fn handle_exec(&mut self, pid: Pid, argv: Vec<String>, prev_tid: Option<Pid>, mut end: ThreadEnd) {
         let parent = if let Some(prev_tid) = prev_tid {
             // finish and store previous thread
             let prev_exists = self.threads.contains_key(&prev_tid);
             let prev_thread = self.get_thread(prev_tid);
+            self.update_usage(pid, &mut end);
             {
                 let mut prev_thread = prev_thread.borrow_mut();
                 prev_thread.end = Some(end.clone());
@@ -322,11 +313,15 @@ impl ThreadTracker {
         }
     }
 
-    pub(crate) fn finish_thread(&mut self, tid: Pid, proc_end: ThreadEnd) {
+    pub(crate) fn finish_thread(&mut self, tid: Pid, mut proc_end: ThreadEnd) {
         let thread = self.get_thread(tid);
         let mut thread = thread.borrow_mut();
-        trace!("thread end #{} {} cpu={:.1}ms", thread.ordinal, thread.tid, proc_end.usage.cpu().as_seconds_f64() * 1000.0);
-        thread.end = Some(proc_end);
+        if thread.end.is_none() {
+            self.update_usage(thread.tid, &mut proc_end);
+            trace!("thread end #{} {} cpu={:.1}ms", thread.ordinal, thread.tid, proc_end.usage.cpu().as_seconds_f64() * 1000.0);
+
+            // fix end cpu - read thread-specific stats
+            thread.end = Some(proc_end);
+        }
     }
 }
-

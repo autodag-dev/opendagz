@@ -1,16 +1,16 @@
 use std::cell::RefCell;
 use std::{fmt, io};
+use std::collections::HashMap;
 use std::io::stdout;
 use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use colored::Colorize;
-use tracing::debug;
+use tracing::{debug};
 use crate::thread_tracker::{ProcessEndReason, ResourceUsage, ThreadInit, ThreadSpan, ThreadTracker};
 
 pub(crate) struct CommandSpan {
     ordinal: usize,
-    tree_depth: usize,
     lead: Rc<RefCell<ThreadSpan>>,
     children: Vec<Rc<RefCell<CommandSpan>>>,
 }
@@ -28,58 +28,26 @@ pub fn format_elapsed<W: fmt::Write>(elapsed: chrono::Duration, w: &mut W) -> fm
     }
 }
 
-impl CommandSpan {
-    fn collect_commands(commands: &mut Vec<Rc<RefCell<CommandSpan>>>, next_ordinal: &mut usize, thread: &ThreadSpan, tree_depth: &mut usize) {
-        for child_rc in &thread.children {
-            let child = child_rc.borrow();
-            if matches!(child.init, ThreadInit::Exec(_)) {
-                let new_command = CommandSpan::new(child_rc.clone(), next_ordinal);
-                *tree_depth = (*tree_depth).max(new_command.tree_depth + 1);
-                commands.push(Rc::new(RefCell::new(new_command)));
-            } else {
-                Self::collect_commands(commands, next_ordinal, &child, tree_depth);
-            }
-        }
-    }
-
-    fn new(lead: Rc<RefCell<ThreadSpan>>, next_ordinal: &mut usize) -> Self {
-        let mut children = Vec::new();
-        let ordinal = *next_ordinal;
-        *next_ordinal += 1;
-        let mut tree_depth = 1;
-        Self::collect_commands(&mut children, next_ordinal, &lead.borrow(), &mut tree_depth);
-        debug!("new command #{}: lead=#{} {} {:?}",
-            ordinal, lead.borrow().ordinal, lead.borrow().tid, lead.borrow().init);
-        Self {
-            ordinal,
-            tree_depth,
-            lead,
-            children,
-        }
-    }
-}
-
 #[derive(Default)]
-struct ProcessGroup {
+struct CommandGroup {
     num_execs: usize,
     total_rss_kb: i64,
     max_rss_kb: i64,
     total_elapsed: Duration,
-    total_usage: ResourceUsage,
+    total_self_usage: ResourceUsage,
+    total_tree_usage: ResourceUsage,
 }
 
-impl ProcessGroup {
-    fn add(&mut self, proc: Rc<RefCell<CommandSpan>>) {
-        let proc = proc.borrow();
-        let lead = proc.lead.borrow();
-        let rss_kb = if let Some(end) = lead.end.as_ref() { end.usage.max_rss_kb } else { 0 };
+impl CommandGroup {
+    fn add(&mut self, cmd: &CommandSpan) {
+        let lead = cmd.lead.borrow();
+        let rss_kb = lead.cmd_usage.max_rss_kb;
         self.num_execs += 1;
         self.total_rss_kb += rss_kb;
         self.max_rss_kb = self.max_rss_kb.max(rss_kb);
-        self.total_elapsed += proc.elapsed();
-        if let Some(end) = lead.end.as_ref() {
-            self.total_usage.add(&end.usage);
-        }
+        self.total_elapsed += cmd.elapsed();
+        self.total_self_usage.add(&lead.cmd_usage);
+        self.total_tree_usage.add(&lead.tree_usage);
     }
 }
 
@@ -93,21 +61,83 @@ impl CommandSpan {
 pub(crate) struct CommandTree {
     is_tty: bool,
     start_time: Instant,
-    root: Rc<RefCell<CommandSpan>>,
+    elapsed: Duration,
+    num_commands: usize,
+    depth: usize,
+    groups: HashMap<String, CommandGroup>,
 }
 
 impl CommandTree {
-    pub(crate) fn new(root: Rc<RefCell<ThreadSpan>>) -> Self {
-        let root = CommandSpan::new(root.clone(), &mut 1);
-        let start_time = root.lead.borrow().start_time;
-        let root = Rc::new(RefCell::new(root));
+    pub(crate) fn new(root: Rc<RefCell<ThreadSpan>>) -> (Self, CommandSpan) {
+        let start_time = root.borrow().start_time;
+        let elapsed = root.borrow().tree_end_time - start_time;
 
         let is_tty = nix::unistd::isatty(stdout().as_fd()).unwrap_or(false);
-        Self {
+        let mut tree = Self {
             start_time,
+            elapsed,
             is_tty,
-            root,
+            num_commands: 0,
+            depth: 0,
+            groups: Default::default()
+        };
+        let root = if let ThreadInit::Exec(argv) = &root.borrow().init {
+            tree.create_command(root.clone(), argv, 1)
+        } else {
+            panic!("Root command without argv");
+        };
+        (tree, root)
+    }
+
+    fn collect_commands(&mut self, commands: &mut Vec<Rc<RefCell<CommandSpan>>>, thread: &ThreadSpan, depth: usize) {
+        for child_rc in &thread.children {
+            let child = child_rc.borrow();
+            if let ThreadInit::Exec(argv) = &child.init {
+                let new_command = self.create_command(child_rc.clone(), argv, depth);
+                self.depth = self.depth.max(depth);
+                commands.push(Rc::new(RefCell::new(new_command)));
+            } else {
+                self.collect_commands(commands, &child, depth);
+            }
         }
+    }
+
+    fn create_command(&mut self, lead: Rc<RefCell<ThreadSpan>>, argv: &Vec<String>, depth: usize) -> CommandSpan {
+        let mut children = Vec::new();
+        self.num_commands += 1;
+        let ordinal = self.num_commands;
+        self.collect_commands(&mut children, &lead.borrow(), depth + 1);
+        debug!("new command #{}: lead=#{} {} {:?}",
+            ordinal, lead.borrow().ordinal, lead.borrow().tid, lead.borrow().init);
+        let cmd = CommandSpan {
+            ordinal,
+            lead,
+            children,
+        };
+        let argv0 = argv[0].as_str();
+        let argv0 = match argv0.rsplit_once('/') {
+            Some(argv0) => argv0.1,
+            None => argv0,
+        };
+        let cmd_type = match argv0 {
+            // command dispatchers
+            "env" | "zig" | "time" | "cargo" => {
+                let mut i = 1;
+                let argv1 = loop {
+                    if !argv[i].starts_with('-') {
+                        break &argv[i]
+                    }
+                    if argv[i] == "-C" {
+                        i += 1;
+                    }
+                    i += 1;
+                };
+                format!("{} {}", argv[0], argv1)
+            }
+            _ => argv[0].clone(),
+        };
+        self.groups.entry(cmd_type).or_default().add(&cmd);
+        cmd
     }
 
     fn print_tree(&self, output: &mut dyn io::Write, cmd: &CommandSpan, indent: &mut String, postfix: &mut String, last: bool, is_root: bool) {
@@ -116,10 +146,9 @@ impl CommandTree {
         let elapsed = cmd.elapsed();
         let connector = if is_root { "" } else if last { "└─" } else { "├─" };
 
-        let argv_cutoff = if self.is_tty { 100 } else { 0 };
+        let argv_cutoff = if self.is_tty { 100 } else { 60000 };
         let argv = if let ThreadInit::Exec(argv) = &lead.init { argv.join(" ") } else { "ERROR: missing argv".into() };
-        let mut cmd_usage = lead.tree_usage.clone();
-        cmd_usage.sub(&lead.children_usage);
+        let cmd_usage = &lead.cmd_usage;
         let mut start_time = String::new();
         format_elapsed(chrono::Duration::from_std(lead.start_time - self.start_time).unwrap(), &mut start_time).unwrap();
 
@@ -130,7 +159,7 @@ impl CommandTree {
              100.0 * cmd_usage.cpu().as_seconds_f64() / elapsed.as_secs_f64(),
              100.0 * lead.tree_usage.cpu().as_seconds_f64() / elapsed.as_secs_f64(),
              cmd_usage.max_rss_kb / 1024,
-             cmd_usage.threads,
+             lead.tree_usage.threads,
              match cmd_end.reason {
                  ProcessEndReason::ExitCode(code) | ProcessEndReason::LateExitCode(code) => {
                      if code == 0 { format!("[rc={}]", code).normal() } else { format!("[rc={}]", code).bright_red() }
@@ -155,73 +184,44 @@ impl CommandTree {
             indent.truncate(prev_indent_len);
         }
     }
+
+    fn print_groups(&self, output: &mut dyn io::Write) {
+        if self.groups.values().any(|group| group.num_execs >= 3) {
+            writeln!(output, "\nGroup by command:").expect("Failed to write to output");
+            let mut proc_groups = self.groups.iter().collect::<Vec<_>>();
+            proc_groups.sort_by_key(|(_, group)| group.total_self_usage.cpu());
+            for (name, group) in proc_groups {
+                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>5} execs  {name}",
+                         group.total_self_usage.cpu().as_seconds_f64(),
+                         100.0 * group.total_self_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
+                         100.0 * group.total_tree_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
+                         group.total_rss_kb / 1024 / group.num_execs as i64,
+                         group.max_rss_kb / 1024,
+                         group.num_execs,
+                ).expect("Failed to write to output");
+            }
+        }
+    }
     
+    fn print_summary(&self, output: &mut dyn io::Write, root: &CommandSpan) {
+        let root_lead = root.lead.borrow();
+        if let ThreadInit::Exec(argv) = &root_lead.init {
+            writeln!(output, "\n{}: {} commands {:7.3}s {:7.1}%cpu",
+                     argv[0],
+                     self.num_commands,
+                     self.elapsed.as_secs_f64(),
+                     100.0 * root_lead.tree_usage.cpu().as_seconds_f64() / self.elapsed.as_secs_f64()
+            ).expect("Failed to write to output");
+        }
+    }
+
     pub(crate) fn report(output: &mut dyn io::Write, tracker: &ThreadTracker) {
         let root_thread = tracker.root.as_ref().unwrap();
         root_thread.borrow_mut().compile_tree(0);
-        let tree = CommandTree::new(root_thread.clone());
-        let root = tree.root.borrow();
-        let mut postfix = "  ".repeat(root.tree_depth);
+        let (tree, root) = CommandTree::new(root_thread.clone());
+        let mut postfix = "  ".repeat(tree.depth);
         tree.print_tree(output, &root, &mut String::new(), &mut postfix, true, true);
+        tree.print_groups(output);
+        tree.print_summary(output, &root);
     }
-
-    // pub(crate) fn report(&self, output: &mut dyn io::Write) {
-    //     let mut proc_groups: HashMap<String, ProcessGroup> = Default::default();
-    //     let tree_depth = root.compile_tree();
-    //     drop(root);
-    //     let root = self.root.as_ref().unwrap().borrow();
-    // 
-    //     for proc_rc in self.procs.values() {
-    //         let proc = proc_rc.borrow();
-    //         proc_groups.entry(proc.argv[0].clone()).or_default().add(proc_rc.clone());
-    //         error!("Active process #{} {} pid={} has {} active threads: {}",
-    //             proc.ordinal, proc.argv[0], proc.pid, proc.active_threads.len(),
-    //                  proc.active_threads.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
-    //     }
-    // 
-    //     let mut total_cpu_time = Duration::default();
-    //     let total_elapsed = Instant::now() - root.start_time;
-    // 
-    //     let mut orphans = Vec::new();
-    //     for proc_rc in &self.finished {
-    //         let proc = proc_rc.borrow();
-    //         proc_groups.entry(proc.argv[0].clone()).or_default().add(proc_rc.clone());
-    //         total_cpu_time += proc.self_cpu_time;
-    //         if proc.ordinal != 1 && proc.spawner.is_none() {
-    //             error!("process without parent: #{} {}", proc.ordinal, proc.pid);
-    //             orphans.push(proc_rc.clone());
-    //         }
-    //     }
-    //     let mut postfix = "  ".repeat(tree_depth + 1);
-    // 
-    //     self.print_tree(output, &root, &mut String::new(), &mut postfix, true, true);
-    //     for (num, orphan) in orphans.iter().enumerate() {
-    //         let orphan = orphan.borrow();
-    //         self.print_tree(output, &orphan, &mut String::from("  "), &mut postfix, num == orphans.len() - 1, false);
-    //     }
-    // 
-    //     if proc_groups.values().any(|group| group.num_execs >= 3) {
-    //         writeln!(output, "\nGroup by command:").expect("Failed to write to output");
-    //         let mut proc_groups = proc_groups.iter().collect::<Vec<_>>();
-    //         proc_groups.sort_by_key(|(_, group)| group.total_self_cpu_time);
-    //         for (name, group) in proc_groups {
-    //             writeln!(output, "{:>9.3}s {:>7.1}%cpu {:4} (tree: {:7.1}%cpu) MB avg {:4} MB max {:>5} execs  {name}",
-    //                      group.total_self_cpu_time.as_secs_f64(),
-    //                      100.0 * group.total_self_cpu_time.as_secs_f64() / group.total_elapsed.as_secs_f64(),
-    //                      100.0 * group.total_tree_cpu_time.as_secs_f64() / group.total_elapsed.as_secs_f64(),
-    //                      group.total_rss_kb / 1024 / group.num_execs as i64,
-    //                      group.max_rss_kb / 1024,
-    //                      group.num_execs,
-    //             ).expect("Failed to write to output");
-    //         }
-    //     }
-    // 
-    //     writeln!(output, "{}: {} processes {:7.3}s {:7.1}%cpu",
-    //              root.argv[0],
-    //              self.finished.len(),
-    //              total_elapsed.as_secs_f64(),
-    //              100.0 * total_cpu_time.as_secs_f64() / total_elapsed.as_secs_f64()
-    //     ).expect("Failed to write to output");
-    // 
-    // }
 }
