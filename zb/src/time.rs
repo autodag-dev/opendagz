@@ -9,13 +9,14 @@ use nix::errno::Errno;
 use nix::libc;
 use tracing::{debug, error, trace};
 use tracing_subscriber::{fmt, prelude::*, filter::LevelFilter};
-use crate::thread_monitor::{ProcessEnd, ProcessEndReason, ThreadMonitor};
+use crate::command_tree::CommandTree;
+use crate::thread_tracker::{ThreadEnd, ProcessEndReason, ThreadTracker};
 
 #[derive(clap::Args)]
 pub(crate) struct TimeCommand {
     /// Show verbose output
-    #[arg(short, long)]
-    verbose: bool,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Output format (real, user, sys)
     #[arg(short, long, default_value = "real")]
@@ -31,7 +32,6 @@ pub(crate) struct TimeCommand {
     #[arg(trailing_var_arg = true, required = true)]
     args: Vec<String>,
 }
-
 
 
 impl TimeCommand {
@@ -52,7 +52,7 @@ impl TimeCommand {
             }
         };
 
-        let mut monitor = ThreadMonitor::new();
+        let mut tracker = ThreadTracker::new();
         let mut root_exit_code = None;
         let mut deadline = None;
 
@@ -78,10 +78,7 @@ impl TimeCommand {
             match wait_result {
                 Ok(WaitStatus::Exited(tid, status)) => {
                     trace!("waitpid result exit: {:?}", wait_result);
-                    monitor.finish_thread(tid, ProcessEnd::from_rusage(ProcessEndReason::LateExitCode(status), &rusage));
-                    if monitor.active_procs.is_empty() {
-                        debug!("all child processes have exited, expecting last wait");
-                    }
+                    tracker.finish_thread(tid, ThreadEnd::from_rusage(ProcessEndReason::LateExitCode(status), &rusage));
                     if tid == root_pid {
                         root_exit_code = Some(status);
                         deadline = Some(Instant::now() + std::time::Duration::from_millis(200));
@@ -111,7 +108,8 @@ impl TimeCommand {
                             match event_data {
                                 Ok(new_pid) => {
                                     let new_tid = Pid::from_raw(new_pid as libc::pid_t);
-                                    monitor.start_thread(new_tid, parent_tid, event);
+                                    let is_fork = event == libc::PTRACE_EVENT_FORK || event == libc::PTRACE_EVENT_VFORK;
+                                    tracker.handle_spawn(new_tid, parent_tid, is_fork);
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -129,7 +127,7 @@ impl TimeCommand {
                                         .split('\0')
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>();
-                                    monitor.handle_exec(parent_tid, argv, Some(prev_tid), ProcessEnd::from_rusage(
+                                    tracker.handle_exec(parent_tid, argv, Some(prev_tid), ThreadEnd::from_rusage(
                                         ProcessEndReason::Exec,
                                         &rusage,
                                     ));
@@ -142,7 +140,7 @@ impl TimeCommand {
                         libc::PTRACE_EVENT_EXIT => {
                             match event_data {
                                 Ok(exit_code) => {
-                                    monitor.finish_thread(parent_tid, ProcessEnd::from_rusage(
+                                    tracker.finish_thread(parent_tid, ThreadEnd::from_rusage(
                                         ProcessEndReason::ExitCode(exit_code as i32 >> 8), &rusage));
                                 }
                                 Err(e) => {
@@ -160,7 +158,7 @@ impl TimeCommand {
                     }
                 }
                 Ok(WaitStatus::Stopped(pid, signal)) => {
-                    if monitor.active_procs.is_empty() {
+                    if tracker.threads.is_empty() {
                         // first child
                         ptrace::setoptions(
                             pid,
@@ -173,8 +171,8 @@ impl TimeCommand {
                         .unwrap_or_else(|e| {
                             error!("Failed to set ptrace options for child process {}: {}", pid, e)
                         });
-                        monitor.handle_exec(pid, self.args.clone(), None,
-                            ProcessEnd::from_rusage(ProcessEndReason::Exec, &rusage));
+                        tracker.handle_exec(pid, self.args.clone(), None,
+                                            ThreadEnd::from_rusage(ProcessEndReason::Exec, &rusage));
                     }
 
                     let cont_signal = if signal == nix::sys::signal::SIGTRAP { None } else { Some(signal) };
@@ -185,7 +183,7 @@ impl TimeCommand {
                             error!("Failed to continue process {}: {}", pid, e);
                         }
                     });
-                    if signal != nix::sys::signal::SIGUSR1 {
+                    if signal != nix::sys::signal::SIGSTOP {
                         trace!("thread {} stop with signal {}", pid, signal);
                     }
                 }
@@ -206,18 +204,25 @@ impl TimeCommand {
         }
 
         if let Some(output) = &self.output {
-            monitor.report(&mut File::create(output).expect("Failed to create output file"));
+            CommandTree::report(&mut File::create(output).expect("Failed to create output file"), &tracker);
         } else {
-            monitor.report(&mut io::stdout());
+            CommandTree::report(&mut io::stdout(), &tracker);
         };
         process::exit(root_exit_code.unwrap_or(2));
     }
 
     pub(crate) fn run(&self) {
+        let console_level = match self.verbose { 
+            0 => LevelFilter::WARN,
+            1 => LevelFilter::INFO,
+            2 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        };
         let console_layer = fmt::layer()
             .with_writer(io::stderr)
             .with_ansi(true)
-            .with_filter(LevelFilter::WARN);
+            .with_timer(fmt::time::uptime()) // Shows time since program start
+            .with_filter(console_level);
 
         let tracing_builder = tracing_subscriber::registry().with(console_layer);
 
