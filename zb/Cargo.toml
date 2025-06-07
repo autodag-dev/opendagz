@@ -1,8 +1,17 @@
 [package]
-name = "zb"
+name = "dagz_zb"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3"
+description = "CLI to Dagz Accelered CI Platform"
+repository = "https://github.com/autodag-dev/opendagz"
+readme = "README.md"
+keywords = ["performance", "metrics", "ci", "build"]
+
+[[bin]]
+name = "zb"
+path = "src/main.rs"
+
 
 [dependencies]
 clap = { version = "4.5.20", default-features = false, features = ["derive", "std", "help", "usage", "color", "error-context"] }

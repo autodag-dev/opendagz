@@ -4,6 +4,8 @@ use nix::unistd::{ForkResult, Pid};
 use std::ffi::CString;
 use std::{io, mem, process};
 use std::fs::File;
+use std::io::stdout;
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -12,7 +14,7 @@ use nix::libc;
 use tracing::{debug, error, trace};
 use tracing_subscriber::{fmt, prelude::*, filter::LevelFilter};
 use crate::command_tree::CommandTree;
-use crate::thread_tracker::{ThreadEnd, ProcessEndReason, ThreadTracker};
+use crate::thread_tracker::{ThreadEnd, ThreadEndReason, ThreadTracker};
 
 /// Run a command and show its process tree and metrics.
 #[derive(clap::Args)]
@@ -87,18 +89,18 @@ impl TimeCommand {
             match wait_result {
                 Ok(WaitStatus::Exited(tid, status)) => {
                     trace!("waitpid result exit: {:?}", wait_result);
-                    tracker.finish_thread(tid, ThreadEnd::from_rusage(ProcessEndReason::LateExitCode(status), &rusage));
+                    tracker.finish_thread(tid, ThreadEnd::from_rusage(ThreadEndReason::LateExitCode(status), &rusage));
                     if tid == root_pid {
-                        root_end = Some(ProcessEndReason::ExitCode(status));
+                        root_end = Some(ThreadEndReason::ExitCode(status));
                         deadline = Some(Instant::now() + Duration::from_millis(200));
                     }
                 }
                 Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                    error!("Thread {pid} killed by {signal}");
+                    debug!("Thread {pid} killed by {signal}");
                     if pid == root_pid {
-                        root_end = Some(ProcessEndReason::Signal(signal));
+                        root_end = Some(ThreadEndReason::Signal(signal));
                     }
-                    tracker.finish_thread(pid, ThreadEnd::from_rusage(ProcessEndReason::Signal(signal), &rusage));
+                    tracker.finish_thread(pid, ThreadEnd::from_rusage(ThreadEndReason::Signal(signal), &rusage));
                 }
                 Ok(WaitStatus::PtraceEvent(parent_tid, _signal, event)) => {
                     let event_data = ptrace::getevent(parent_tid);
@@ -136,7 +138,7 @@ impl TimeCommand {
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>();
                                     tracker.handle_exec(parent_tid, argv, Some(prev_tid), ThreadEnd::from_rusage(
-                                        ProcessEndReason::Exec,
+                                        ThreadEndReason::Exec,
                                         &rusage,
                                     ));
                                 }
@@ -149,7 +151,7 @@ impl TimeCommand {
                             match event_data {
                                 Ok(exit_code) => {
                                     tracker.finish_thread(parent_tid, ThreadEnd::from_rusage(
-                                        ProcessEndReason::ExitCode(exit_code as i32 >> 8), &rusage));
+                                        ThreadEndReason::ExitCode(exit_code as i32 >> 8), &rusage));
                                 }
                                 Err(e) => {
                                     error!("Failed to get new child PID from ptrace event: {}", e);
@@ -180,7 +182,7 @@ impl TimeCommand {
                             error!("Failed to set ptrace options for child process {}: {}", pid, e)
                         });
                         tracker.handle_exec(pid, self.command.clone(), None,
-                                            ThreadEnd::from_rusage(ProcessEndReason::Exec, &rusage));
+                                            ThreadEnd::from_rusage(ThreadEndReason::Exec, &rusage));
                     }
 
                     let cont_signal = if signal == nix::sys::signal::SIGTRAP { None } else { Some(signal) };
@@ -204,21 +206,27 @@ impl TimeCommand {
                         debug!("waitpid: No more child processes");
                     } else {
                         error!("waitpid error: {}", e);
-                        root_end = Some(ProcessEndReason::ExitCode(2));
+                        root_end = Some(ThreadEndReason::ExitCode(2));
                     }
                     break;
                 }
             }
         }
 
-        if let Some(output) = &self.output {
-            CommandTree::report(&mut File::create(output).expect("Failed to create output file"), &tracker, root_end.clone());
+        let is_tty = if self.output.is_some() {
+            false
         } else {
-            CommandTree::report(&mut io::stdout(), &tracker, root_end.clone());
+            nix::unistd::isatty(stdout().as_fd()).unwrap_or(false)  
+        };
+        
+        if let Some(output) = &self.output {
+            CommandTree::report(&mut File::create(output).expect("Failed to create output file"), &tracker, root_end.clone(), is_tty);
+        } else {
+            CommandTree::report(&mut stdout(), &tracker, root_end.clone(), is_tty);
         };
         process::exit(match root_end {
-            Some(ProcessEndReason::ExitCode(code)) => code,
-            Some(ProcessEndReason::LateExitCode(code)) => code,
+            Some(ThreadEndReason::ExitCode(code)) => code,
+            Some(ThreadEndReason::LateExitCode(code)) => code,
             _ => 2
         });
     }

@@ -1,13 +1,11 @@
 use std::cell::RefCell;
 use std::{fmt, io};
 use std::collections::HashMap;
-use std::io::stdout;
-use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use colored::Colorize;
 use tracing::{debug};
-use crate::thread_tracker::{ProcessEndReason, ResourceUsage, ThreadInit, ThreadSpan, ThreadTracker};
+use crate::thread_tracker::{ThreadEndReason, ResourceUsage, ThreadInit, ThreadSpan, ThreadTracker};
 
 pub(crate) struct CommandSpan {
     ordinal: usize,
@@ -41,20 +39,20 @@ struct CommandGroup {
 impl CommandGroup {
     fn add(&mut self, cmd: &CommandSpan) {
         let lead = cmd.lead.borrow();
-        let rss_kb = lead.cmd_usage.max_rss_kb;
+        let rss_kb = lead.usage.max_rss_kb;
         self.num_execs += 1;
         self.total_rss_kb += rss_kb;
         self.max_rss_kb = self.max_rss_kb.max(rss_kb);
         self.total_elapsed += cmd.elapsed();
-        self.total_self_usage.add(&lead.cmd_usage);
-        self.total_tree_usage.add(&lead.tree_usage);
+        self.total_self_usage.add_all(&lead.usage);
+        self.total_tree_usage.add_all(&lead.tree_usage);
     }
 }
 
 impl CommandSpan {
     pub(crate) fn elapsed(&self) -> Duration {
         let lead = self.lead.borrow();
-        lead.tree_end_time - lead.start_time
+        lead.end_time - lead.start_time
     }
 }
 
@@ -68,11 +66,10 @@ pub(crate) struct CommandTree {
 }
 
 impl CommandTree {
-    pub(crate) fn new(root: Rc<RefCell<ThreadSpan>>) -> (Self, CommandSpan) {
+    pub(crate) fn new(root: Rc<RefCell<ThreadSpan>>, is_tty: bool) -> (Self, CommandSpan) {
         let start_time = root.borrow().start_time;
-        let elapsed = root.borrow().tree_end_time - start_time;
+        let elapsed = root.borrow().end_time - start_time;
 
-        let is_tty = nix::unistd::isatty(stdout().as_fd()).unwrap_or(false);
         let mut tree = Self {
             start_time,
             elapsed,
@@ -141,32 +138,34 @@ impl CommandTree {
 
     fn print_tree(&self, output: &mut dyn io::Write, cmd: &CommandSpan, indent: &mut String, postfix: &mut String, last: bool, is_root: bool) {
         let lead = cmd.lead.borrow();
-        let cmd_end = lead.end.as_ref().unwrap();
+        let end_reason = lead.end_reason.as_ref().unwrap().clone();
         let elapsed = cmd.elapsed();
         let connector = if is_root { "" } else if last { "└─" } else { "├─" };
 
         let argv_cutoff = if self.is_tty { 100 } else { 60000 };
         let argv = if let ThreadInit::Exec(argv) = &lead.init { argv.join(" ") } else { "ERROR: missing argv".into() };
-        let cmd_usage = &lead.cmd_usage;
+        let cmd_usage = &lead.usage;
         let mut start_time = String::new();
         format_elapsed(chrono::Duration::from_std(lead.start_time - self.start_time).unwrap(), &mut start_time).unwrap();
 
-        writeln!(output, "{indent}{connector}{:<5}{postfix} {} {:9.3}s {:7.1}%cpu (tree: {:7.1}%cpu) {:4} MB {:>4} threads {:>8} {:.argv_cutoff$}",
-             format!("#{}", cmd.ordinal),
-             start_time,
-             elapsed.as_secs_f64(),
-             100.0 * cmd_usage.cpu().as_seconds_f64() / elapsed.as_secs_f64(),
-             100.0 * lead.tree_usage.cpu().as_seconds_f64() / elapsed.as_secs_f64(),
-             cmd_usage.max_rss_kb / 1024,
-             lead.tree_usage.threads,
-             match cmd_end.reason {
-                 ProcessEndReason::ExitCode(code) | ProcessEndReason::LateExitCode(code) => {
-                     if code == 0 { format!("[rc={}]", code).normal() } else { format!("[rc={}]", code).bright_red() }
-                 },
-                 ProcessEndReason::Signal(signal) => format!("[killed by {}]", signal).bright_red(),
-                 ProcessEndReason::Exec => "[exec]".to_string().normal(),
-             },
-             argv,
+        writeln!(output, "{indent}{connector}{:<5}{postfix} {} {:9.3}s {:7.1}%cpu (tree: {:7.1}%cpu) {:4} MB {:>8} iops {:4} PF {:>4} threads {:>8} {:.argv_cutoff$}",
+            format!("#{}", cmd.ordinal),
+            start_time,
+            elapsed.as_secs_f64(),
+            100.0 * cmd_usage.cpu().as_seconds_f64() / elapsed.as_secs_f64(),
+            100.0 * lead.tree_usage.cpu().as_seconds_f64() / elapsed.as_secs_f64(),
+            cmd_usage.max_rss_kb / 1024,
+            cmd_usage.format_iops(),
+            cmd_usage.major_pf,
+            lead.tree_usage.threads,
+            match end_reason {
+                ThreadEndReason::ExitCode(code) | ThreadEndReason::LateExitCode(code) => {
+                    if code == 0 { format!("[rc={}]", code).normal() } else { format!("[rc={}]", code).bright_red() }
+                },
+                ThreadEndReason::Signal(signal) => format!("[killed by {}]", signal).bright_red(),
+                ThreadEndReason::Exec => "[exec]".to_string().normal(),
+            },
+            argv,
         ).expect("Failed to write to output");
 
         let prev_indent_len = indent.len();
@@ -190,49 +189,56 @@ impl CommandTree {
             let mut proc_groups = self.groups.iter().collect::<Vec<_>>();
             proc_groups.sort_by_key(|(_, group)| group.total_self_usage.cpu());
             for (name, group) in proc_groups {
-                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>5} execs  {name}",
+                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>10} iops {:6} PF {:>5} execs  {name}",
                          group.total_self_usage.cpu().as_seconds_f64(),
                          100.0 * group.total_self_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
                          100.0 * group.total_tree_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
                          group.total_rss_kb / 1024 / group.num_execs as i64,
                          group.max_rss_kb / 1024,
+                         group.total_self_usage.format_iops(),
+                         group.total_self_usage.major_pf,
                          group.num_execs,
                 ).expect("Failed to write to output");
             }
         }
     }
     
-    fn print_summary(&self, output: &mut dyn io::Write, root: &CommandSpan, end: Option<ProcessEndReason>) {
+    fn print_summary(&self, output: &mut dyn io::Write, root: &CommandSpan, end: Option<ThreadEndReason>) {
         let root_lead = root.lead.borrow();
         if let ThreadInit::Exec(argv) = &root_lead.init {
-            writeln!(output, "\n{}: {} commands {:7.3}s {:7.1}%cpu  {}",
+            writeln!(output, "\n{}: {} commands {:7.3}s {:7.1}%cpu {:>12} iops {:>6} PF  {}",
                  argv[0],
                  self.num_commands,
                  self.elapsed.as_secs_f64(),
                  100.0 * root_lead.tree_usage.cpu().as_seconds_f64() / self.elapsed.as_secs_f64(),
+                 root_lead.tree_usage.format_iops(),
+                 root_lead.tree_usage.major_pf,
                  match end {
                      None => "Still running".normal(),
-                     Some(ProcessEndReason::ExitCode(code)) | Some(ProcessEndReason::LateExitCode(code)) => {
+                     Some(ThreadEndReason::ExitCode(code)) | Some(ThreadEndReason::LateExitCode(code)) => {
                          if code == 0 {
                              format!("Exited {code}").normal()
                          } else {
                              format!("Exited {code}").bright_red()
                          }
                      },
-                     Some(ProcessEndReason::Signal(signal)) => format!("Killed by {signal}").bright_red(),
-                     Some(ProcessEndReason::Exec) => "Unknown termination reason".bright_red(),
+                     Some(ThreadEndReason::Signal(signal)) => format!("Killed by {signal}").bright_red(),
+                     Some(ThreadEndReason::Exec) => "Unknown termination reason".bright_red(),
                 }
             ).expect("Failed to write to output");
         }
     }
 
-    pub(crate) fn report(output: &mut dyn io::Write, tracker: &ThreadTracker, end: Option<ProcessEndReason>) {
+    pub(crate) fn report(output: &mut dyn io::Write, tracker: &ThreadTracker, end: Option<ThreadEndReason>, is_tty: bool) {
         let root_thread = tracker.root.as_ref().unwrap();
         root_thread.borrow_mut().compile_tree(0);
-        let (tree, root) = CommandTree::new(root_thread.clone());
+        let (tree, root) = CommandTree::new(root_thread.clone(), is_tty);
         let mut postfix = "  ".repeat(tree.depth);
         tree.print_tree(output, &root, &mut String::new(), &mut postfix, true, true);
         tree.print_groups(output);
+        if !tracker.have_schedstats {
+            eprintln!("** schedstats are not enabled in the kernel, CPU measurements may be skewed");
+        }
         tree.print_summary(output, &root, end);
     }
 }
