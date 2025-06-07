@@ -12,7 +12,7 @@ use tracing::{debug, error, trace};
 pub(crate) enum ProcessEndReason {
     ExitCode(i32),
     LateExitCode(i32),
-    Signal(i32),
+    Signal(nix::sys::signal::Signal),
     Exec
 }
 
@@ -316,7 +316,7 @@ impl ThreadTracker {
     pub(crate) fn finish_thread(&mut self, tid: Pid, mut proc_end: ThreadEnd) {
         let thread = self.get_thread(tid);
         let mut thread = thread.borrow_mut();
-        if thread.end.is_none() {
+        if thread.end.is_none() || matches!(proc_end.reason, ProcessEndReason::Signal(_)) {
             self.update_usage(thread.tid, &mut proc_end);
             trace!("thread end #{} {} cpu={:.1}ms", thread.ordinal, thread.tid, proc_end.usage.cpu().as_seconds_f64() * 1000.0);
 

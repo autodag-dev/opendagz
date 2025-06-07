@@ -4,7 +4,9 @@ use nix::unistd::{ForkResult, Pid};
 use std::ffi::CString;
 use std::{io, mem, process};
 use std::fs::File;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::libc;
 use tracing::{debug, error, trace};
@@ -12,51 +14,58 @@ use tracing_subscriber::{fmt, prelude::*, filter::LevelFilter};
 use crate::command_tree::CommandTree;
 use crate::thread_tracker::{ThreadEnd, ProcessEndReason, ThreadTracker};
 
+/// Run a command and show its process tree and metrics.
 #[derive(clap::Args)]
 pub(crate) struct TimeCommand {
-    /// Show verbose output
+    /// Show verbose output (-v | -vv | -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Output format (real, user, sys)
-    #[arg(short, long, default_value = "real")]
-    format: String,
-
-    #[arg(long, help = "Debug log file")]
+    /// Write detailed logs to file
+    #[arg(long)]
     log: Option<String>,
     
     #[arg(short, long, help = "Write output to file instead of stdout")]
     output: Option<String>,
 
-    /// Command and arguments to time
+    /// Command and arguments to run
     #[arg(trailing_var_arg = true, required = true)]
-    args: Vec<String>,
+    command: Vec<String>,
 }
 
 
 impl TimeCommand {
-    pub(crate) fn run_impl(&self) -> Result<(), nix::Error> {
+    pub(crate) fn run_impl(&self) -> Result<(), io::Error> {
         // use nix to create a child process
         let root_pid = match unsafe { nix::unistd::fork()? } {
             ForkResult::Parent { child } => child,
             ForkResult::Child => {
-                ptrace::traceme().map_err(|e| {
-                    error!("Failed to trace child process: {}", e);
-                    process::exit(2);
-                })?;
+                ptrace::traceme()?;
 
                 // Use exec to replace the child process with the command
-                let args: Vec<CString> = self.args.iter().map(|arg| CString::new(arg.clone()).unwrap()).collect();
+                let args: Vec<CString> = self.command.iter().map(|arg| CString::new(arg.clone()).unwrap()).collect();
                 nix::unistd::execvp(&args[0], &args)?;
                 unreachable!("zb-time: Unexpected state: Failed to execvp in child process");
             }
         };
 
+        // set signal handlers
+        let terminate_flag = Arc::new(AtomicBool::new(false));
+        for sig in signal_hook::consts::TERM_SIGNALS {
+            signal_hook::flag::register_conditional_shutdown(*sig, 2, terminate_flag.clone())?;
+            signal_hook::flag::register(*sig, Arc::clone(&terminate_flag))?;
+        }
+
         let mut tracker = ThreadTracker::new();
-        let mut root_exit_code = None;
+        let mut root_end = None;
         let mut deadline = None;
 
         loop {
+            if terminate_flag.load(Ordering::Relaxed) && deadline.is_none() {
+                eprintln!("zb-time: Caught termination signal, command should exit now...\n");
+                deadline = Some(Instant::now() + Duration::from_secs(3));
+            }
+
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
                     error!("Timeout reached after command exit, some processes may still be running");
@@ -80,22 +89,21 @@ impl TimeCommand {
                     trace!("waitpid result exit: {:?}", wait_result);
                     tracker.finish_thread(tid, ThreadEnd::from_rusage(ProcessEndReason::LateExitCode(status), &rusage));
                     if tid == root_pid {
-                        root_exit_code = Some(status);
-                        deadline = Some(Instant::now() + std::time::Duration::from_millis(200));
+                        root_end = Some(ProcessEndReason::ExitCode(status));
+                        deadline = Some(Instant::now() + Duration::from_millis(200));
                     }
                 }
-                Ok(WaitStatus::Signaled(_pid, _signal, _)) => {
-                    // let started = active_threads.remove(&pid).unwrap();
-                    // finished.push(ThreadSpan::new(started, 2, &monitor)); // 2 for killed by signal
-                    // if active_threads.is_empty() {
-                    //     break;
-                    // }
-                    unimplemented!("Handling signaled processes is not implemented yet");
+                Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                    error!("Thread {pid} killed by {signal}");
+                    if pid == root_pid {
+                        root_end = Some(ProcessEndReason::Signal(signal));
+                    }
+                    tracker.finish_thread(pid, ThreadEnd::from_rusage(ProcessEndReason::Signal(signal), &rusage));
                 }
                 Ok(WaitStatus::PtraceEvent(parent_tid, _signal, event)) => {
                     let event_data = ptrace::getevent(parent_tid);
                     ptrace::cont(parent_tid, None).unwrap_or_else(|e| {
-                        if e != nix::Error::ESRCH {
+                        if e == nix::Error::ESRCH {
                             debug!("Process {} already exited, cannot continue", parent_tid);
                         } else {
                             error!("Failed to continue process {}: {}", parent_tid, e);
@@ -171,13 +179,13 @@ impl TimeCommand {
                         .unwrap_or_else(|e| {
                             error!("Failed to set ptrace options for child process {}: {}", pid, e)
                         });
-                        tracker.handle_exec(pid, self.args.clone(), None,
+                        tracker.handle_exec(pid, self.command.clone(), None,
                                             ThreadEnd::from_rusage(ProcessEndReason::Exec, &rusage));
                     }
 
                     let cont_signal = if signal == nix::sys::signal::SIGTRAP { None } else { Some(signal) };
                     ptrace::cont(pid, cont_signal).unwrap_or_else(|e| {
-                        if e != nix::Error::ESRCH {
+                        if e == nix::Error::ESRCH {
                             debug!("Process {} already exited, cannot continue", pid);
                         } else {
                             error!("Failed to continue process {}: {}", pid, e);
@@ -196,7 +204,7 @@ impl TimeCommand {
                         debug!("waitpid: No more child processes");
                     } else {
                         error!("waitpid error: {}", e);
-                        root_exit_code = Some(2);
+                        root_end = Some(ProcessEndReason::ExitCode(2));
                     }
                     break;
                 }
@@ -204,11 +212,15 @@ impl TimeCommand {
         }
 
         if let Some(output) = &self.output {
-            CommandTree::report(&mut File::create(output).expect("Failed to create output file"), &tracker);
+            CommandTree::report(&mut File::create(output).expect("Failed to create output file"), &tracker, root_end.clone());
         } else {
-            CommandTree::report(&mut io::stdout(), &tracker);
+            CommandTree::report(&mut io::stdout(), &tracker, root_end.clone());
         };
-        process::exit(root_exit_code.unwrap_or(2));
+        process::exit(match root_end {
+            Some(ProcessEndReason::ExitCode(code)) => code,
+            Some(ProcessEndReason::LateExitCode(code)) => code,
+            _ => 2
+        });
     }
 
     pub(crate) fn run(&self) {
@@ -240,7 +252,7 @@ impl TimeCommand {
         match self.run_impl() {
             Ok(_) => (),
             Err(e) => {
-                error!("Cannot run {}: {}", self.args.join(" "), e);
+                error!("Cannot run {}: {}", self.command.join(" "), e);
                 process::exit(1);
             }
         }

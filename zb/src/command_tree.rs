@@ -94,7 +94,6 @@ impl CommandTree {
             let child = child_rc.borrow();
             if let ThreadInit::Exec(argv) = &child.init {
                 let new_command = self.create_command(child_rc.clone(), argv, depth);
-                self.depth = self.depth.max(depth);
                 commands.push(Rc::new(RefCell::new(new_command)));
             } else {
                 self.collect_commands(commands, &child, depth);
@@ -102,7 +101,7 @@ impl CommandTree {
         }
     }
 
-    fn create_command(&mut self, lead: Rc<RefCell<ThreadSpan>>, argv: &Vec<String>, depth: usize) -> CommandSpan {
+    fn create_command(&mut self, lead: Rc<RefCell<ThreadSpan>>, argv: &[String], depth: usize) -> CommandSpan {
         let mut children = Vec::new();
         self.num_commands += 1;
         let ordinal = self.num_commands;
@@ -114,27 +113,27 @@ impl CommandTree {
             lead,
             children,
         };
+        self.depth = self.depth.max(depth);
         let argv0 = argv[0].as_str();
         let argv0 = match argv0.rsplit_once('/') {
             Some(argv0) => argv0.1,
             None => argv0,
         };
-        let cmd_type = match argv0 {
-            // command dispatchers
-            "env" | "zig" | "time" | "cargo" => {
-                let mut i = 1;
-                let argv1 = loop {
-                    if !argv[i].starts_with('-') {
-                        break &argv[i]
-                    }
-                    if argv[i] == "-C" {
-                        i += 1;
-                    }
+        
+        let cmd_type = if matches!(argv0, "env" | "zig" | "time" | "cargo" | "bash" | "sh") || argv0.starts_with("python") {
+            let mut i = 1;
+            let argv1 = loop {
+                if !argv[i].starts_with('-') {
+                    break &argv[i]
+                }
+                if argv[i] == "-C" {
                     i += 1;
-                };
-                format!("{} {}", argv[0], argv1)
-            }
-            _ => argv[0].clone(),
+                }
+                i += 1;
+            };
+            format!("{} {}", argv[0], argv1)
+        } else {
+            argv[0].clone()
         };
         self.groups.entry(cmd_type).or_default().add(&cmd);
         cmd
@@ -203,25 +202,37 @@ impl CommandTree {
         }
     }
     
-    fn print_summary(&self, output: &mut dyn io::Write, root: &CommandSpan) {
+    fn print_summary(&self, output: &mut dyn io::Write, root: &CommandSpan, end: Option<ProcessEndReason>) {
         let root_lead = root.lead.borrow();
         if let ThreadInit::Exec(argv) = &root_lead.init {
-            writeln!(output, "\n{}: {} commands {:7.3}s {:7.1}%cpu",
-                     argv[0],
-                     self.num_commands,
-                     self.elapsed.as_secs_f64(),
-                     100.0 * root_lead.tree_usage.cpu().as_seconds_f64() / self.elapsed.as_secs_f64()
+            writeln!(output, "\n{}: {} commands {:7.3}s {:7.1}%cpu  {}",
+                 argv[0],
+                 self.num_commands,
+                 self.elapsed.as_secs_f64(),
+                 100.0 * root_lead.tree_usage.cpu().as_seconds_f64() / self.elapsed.as_secs_f64(),
+                 match end {
+                     None => "Still running".normal(),
+                     Some(ProcessEndReason::ExitCode(code)) | Some(ProcessEndReason::LateExitCode(code)) => {
+                         if code == 0 {
+                             format!("Exited {code}").normal()
+                         } else {
+                             format!("Exited {code}").bright_red()
+                         }
+                     },
+                     Some(ProcessEndReason::Signal(signal)) => format!("Killed by {signal}").bright_red(),
+                     Some(ProcessEndReason::Exec) => "Unknown termination reason".bright_red(),
+                }
             ).expect("Failed to write to output");
         }
     }
 
-    pub(crate) fn report(output: &mut dyn io::Write, tracker: &ThreadTracker) {
+    pub(crate) fn report(output: &mut dyn io::Write, tracker: &ThreadTracker, end: Option<ProcessEndReason>) {
         let root_thread = tracker.root.as_ref().unwrap();
         root_thread.borrow_mut().compile_tree(0);
         let (tree, root) = CommandTree::new(root_thread.clone());
         let mut postfix = "  ".repeat(tree.depth);
         tree.print_tree(output, &root, &mut String::new(), &mut postfix, true, true);
         tree.print_groups(output);
-        tree.print_summary(output, &root);
+        tree.print_summary(output, &root, end);
     }
 }

@@ -1,15 +1,13 @@
-mod time;
+mod time_command;
 mod thread_tracker;
 mod command_tree;
 
 use clap::{command, Parser, Subcommand};
 
 
-
 #[derive(Subcommand)]
 enum DagzCommands {
-    /// Time a command execution
-    Time(time::TimeCommand),
+    Time(time_command::TimeCommand),
 }
 
 #[derive(Parser)]
