@@ -120,8 +120,16 @@ impl CommandTree {
         let cmd_type = if matches!(argv0, "env" | "zig" | "time" | "cargo" | "bash" | "sh") || argv0.starts_with("python") {
             let mut i = 1;
             let argv1 = loop {
+                if i >= argv.len() {
+                    break ""
+                }
+                if argv0 == "sh" || argv0 == "bash" {
+                    if argv[i] == "-c" {
+                        break "";
+                    }
+                }
                 if !argv[i].starts_with('-') {
-                    break &argv[i]
+                    break argv[i].split_whitespace().next().unwrap_or("")
                 }
                 if argv[i] == "-C" {
                     i += 1;
@@ -157,7 +165,7 @@ impl CommandTree {
             cmd_usage.max_rss_kb / 1024,
             cmd_usage.format_iops(),
             cmd_usage.major_pf,
-            lead.tree_usage.threads,
+            lead.usage.threads,
             match end_reason {
                 ThreadEndReason::ExitCode(code) | ThreadEndReason::LateExitCode(code) => {
                     if code == 0 { format!("[rc={}]", code).normal() } else { format!("[rc={}]", code).bright_red() }
@@ -185,19 +193,17 @@ impl CommandTree {
 
     fn print_groups(&self, output: &mut dyn io::Write) {
         if self.groups.values().any(|group| group.num_execs >= 3) {
-            writeln!(output, "\nGroup by command:").expect("Failed to write to output");
+            writeln!(output, "\nGroup by command (most cpu-intensive last):").expect("Failed to write to output");
             let mut proc_groups = self.groups.iter().collect::<Vec<_>>();
             proc_groups.sort_by_key(|(_, group)| group.total_self_usage.cpu());
             for (name, group) in proc_groups {
-                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>10} iops {:6} PF {:>5} execs  {name}",
+                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>5} execs  {name}",
                          group.total_self_usage.cpu().as_seconds_f64(),
                          100.0 * group.total_self_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
                          100.0 * group.total_tree_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
                          group.total_rss_kb / 1024 / group.num_execs as i64,
                          group.max_rss_kb / 1024,
                          group.total_self_usage.format_iops(),
-                         group.total_self_usage.major_pf,
-                         group.num_execs,
                 ).expect("Failed to write to output");
             }
         }

@@ -1,12 +1,12 @@
 [package]
-name = "dagz_zb"
-version = "0.1.0"
+name = "opendagz"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "CLI to Dagz Accelered CI Platform"
+description = "Dagz Accelered CI Platform, Open Edition"
 repository = "https://github.com/autodag-dev/opendagz"
-readme = "README.md"
-keywords = ["performance", "metrics", "ci", "build"]
+readme = "../README.md"
+keywords = ["performance", "metrics", "ci", "build", "tracing"]
 
 [[bin]]
 name = "zb"

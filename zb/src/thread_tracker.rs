@@ -42,10 +42,10 @@ impl ResourceUsage {
     }
 
     pub(crate) fn format_iops(&self) -> String {
-        format!("{}+{}", self.read_iops, self.write_iops)
+        format!("{}+{}k", self.read_iops / 1000, self.write_iops / 1000)
     }
 
-    pub(crate) fn add_self_metrics(&mut self, other: &ResourceUsage) {
+    pub(crate) fn add_thread_metrics(&mut self, other: &ResourceUsage) {
         // These metrics are collected per thread, rather than per tree.
         self.max_rss_kb = self.max_rss_kb.max(other.max_rss_kb);
         self.ucpu += other.ucpu;
@@ -53,8 +53,15 @@ impl ResourceUsage {
         self.threads += other.threads;
     }
 
+    // pub(crate) fn sub_tree_metrics(&mut self, other: &ResourceUsage) {
+    //     // These metrics are collected per tree, so we need to subtract them to get the current process' metrics.
+    //     self.read_iops = self.read_iops.saturating_sub(other.read_iops);
+    //     self.write_iops = other.write_iops.saturating_sub(other.write_iops);
+    //     self.major_pf = other.major_pf.saturating_sub(self.major_pf);
+    // }
+
     pub(crate) fn add_all(&mut self, other: &ResourceUsage) {
-        self.add_self_metrics(other);
+        self.add_thread_metrics(other);
 
         // These metrics are collected per tree.
         self.read_iops += other.read_iops;
@@ -139,16 +146,18 @@ impl ThreadSpan {
 
     pub(crate) fn compile_tree(&mut self, nest_level: usize) {
         self.tree_usage = self.usage.clone();
-        self.tree_usage.threads = 1;
+        self.usage.threads = 1;
         for child in &self.children {
             let mut child = child.borrow_mut();
             child.compile_tree(nest_level + 1);
-            self.tree_usage.add_self_metrics(&child.tree_usage);
             match &child.init {
-                ThreadInit::Exec(_) => {},
+                ThreadInit::Exec(_) => {
+                    self.tree_usage.add_all(&child.tree_usage);
+                },
                 ThreadInit::Forked | ThreadInit::Thread => {
                     // add usage only from sub-commands (recursively)
-                    self.usage.add_self_metrics(&child.usage);
+                    self.tree_usage.add_thread_metrics(&child.tree_usage);
+                    self.usage.add_thread_metrics(&child.usage);
                 }
                 ThreadInit::Unknown => {
                     error!("Unknown thread: #{} {}", self.ordinal, self.tid);
@@ -156,6 +165,8 @@ impl ThreadSpan {
             }
             self.end_time = self.end_time.max(child.end_time);
         }
+        // TODO: accumulate rusage-based metrics better
+        // self.usage.sub_tree_metrics(&self.tree_usage);
         let indent = "  ".repeat(nest_level);
         trace!("{:2} {indent}thread #{} {} cmd_io={} tree_io={}  kind={:?}",
             nest_level, self.ordinal, self.tid,
