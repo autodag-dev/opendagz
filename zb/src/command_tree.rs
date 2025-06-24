@@ -197,13 +197,14 @@ impl CommandTree {
             let mut proc_groups = self.groups.iter().collect::<Vec<_>>();
             proc_groups.sort_by_key(|(_, group)| group.total_self_usage.cpu());
             for (name, group) in proc_groups {
-                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>5} execs  {name}",
+                writeln!(output, "{:>9.3}s {:>7.1}%cpu (tree: {:7.1}%cpu) {:4} MB avg {:4} MB max {:>10} iops {:>5} execs  {name}",
                          group.total_self_usage.cpu().as_seconds_f64(),
                          100.0 * group.total_self_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
                          100.0 * group.total_tree_usage.cpu().as_seconds_f64() / group.total_elapsed.as_secs_f64(),
                          group.total_rss_kb / 1024 / group.num_execs as i64,
                          group.max_rss_kb / 1024,
                          group.total_self_usage.format_iops(),
+                         group.num_execs
                 ).expect("Failed to write to output");
             }
         }
