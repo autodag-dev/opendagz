@@ -2,7 +2,10 @@
 name = "cargo-zb"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 description = "Cargo build with better caching"
+repository = "https://github.com/autodag-dev/opendagz"
+readme = "../README.md"
 
 [[bin]]
 name = "cargo-zb"
