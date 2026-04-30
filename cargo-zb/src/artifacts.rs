@@ -1,44 +1,130 @@
+//! Per-unit artifact attribution and cache storage.
+//!
+//! After cargo finishes a build, the files in `target/` need to be sorted
+//! into per-unit bundles so each unit can be cached / restored independently.
+//! Cargo names every output with the unit's `c_extra_filename` hash:
+//!
+//! - `target/<target>/release/.fingerprint/<crate>-<hash>/...`
+//! - `target/<target>/release/deps/<crate>-<hash>.{rlib,rmeta,so,d}`
+//! - `target/<target>/release/build/<pkg>-<hash>/...`  (build script run + COMPILE)
+//! - `target/<target>/release/<bin_name>` — *no hash*, link to the bin.
+//!
+//! We use the per-unit directory paths cargo's `CompilationFiles` exposes
+//! (`fingerprint_dir`, `build_script_run_dir`, `build_script_dir`) plus a
+//! deps-dir filter on `c_extra_filename`. The naked binary in the build dir
+//! root is attributed to the bin unit by name (cargo's `Compilation::binaries`
+//! / `cdylibs` give the post-build paths if needed).
+
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use crate::cache::CacheBackend;
-use crate::hash::CacheKey;
+use anyhow::{Context, Result};
+use cargo::core::compiler::{BuildRunner, CompileMode, Unit};
 
-pub fn store(
+use crate::cache::CacheBackend;
+
+/// Files belonging to one unit that we want to cache + restore.
+#[derive(Debug, Default, Clone)]
+pub struct UnitArtifacts {
+    /// Absolute paths of files to bundle into the unit's cache entry.
+    pub files: Vec<PathBuf>,
+}
+
+/// Enumerate every file currently on disk that belongs to `unit`.
+pub fn collect_unit_artifacts(
+    runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> UnitArtifacts {
+    let files = runner.files();
+    let metadata = files.metadata(unit);
+    let unit_hash = metadata.c_extra_filename().map(|h| h.to_string());
+
+    let mut paths = Vec::new();
+
+    // Per-unit fingerprint directory: everything in it.
+    let fp_dir = files.fingerprint_dir(unit);
+    walk_dir_files(&fp_dir, &mut paths);
+
+    if unit.mode == CompileMode::RunCustomBuild {
+        // Build-script-run unit: the entire build/<pkg>-<hash>/ tree, including
+        // OUT_DIR, the parsed `output` file, invoked.timestamp, etc.
+        let run_dir = files.build_script_run_dir(unit);
+        walk_dir_files(&run_dir, &mut paths);
+    } else if unit.target.is_custom_build() {
+        // Compile-of-build.rs unit (mode == Build for a custom-build target):
+        // the build-script binary lives in build_script_dir.
+        let bs_dir = files.build_script_dir(unit);
+        walk_dir_files(&bs_dir, &mut paths);
+    }
+
+    // Deps dir entries matching this unit's hash. cargo emits multiple files
+    // here per unit: <prefix><crate>-<hash>.{rlib,rmeta,so,dylib,d,o}.
+    if let Some(hash) = &unit_hash {
+        let deps_dir = files.deps_dir(unit);
+        if let Ok(entries) = std::fs::read_dir(&deps_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else { continue };
+                if name_str.contains(hash) {
+                    paths.push(entry.path());
+                }
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    UnitArtifacts { files: paths }
+}
+
+fn walk_dir_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if !dir.exists() {
+        return;
+    }
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            out.push(entry.into_path());
+        }
+    }
+}
+
+/// Store a unit's artifacts under `unit_key`. Each file's path is stored as
+/// relative to `target_dir` (so restore can reconstruct under any target dir).
+pub fn store_unit(
     cache: &dyn CacheBackend,
-    build_key: &CacheKey,
-    paths: &[PathBuf],
+    unit_key: &[u8; 32],
+    artifacts: &UnitArtifacts,
     target_dir: &Path,
 ) -> Result<usize> {
     let mut manifest: Vec<String> = Vec::new();
-
-    for path in paths {
+    for path in &artifacts.files {
         if !path.exists() {
             tracing::warn!("artifact not found, skipping: {}", path.display());
             continue;
         }
         let rel = path.strip_prefix(target_dir).unwrap_or(path);
         let rel_str = rel.to_string_lossy().to_string();
-
-        cache.store_artifact_from_file(build_key.as_bytes(), &rel_str, path)?;
+        cache
+            .store_artifact_from_file(unit_key, &rel_str, path)
+            .with_context(|| format!("storing {}", path.display()))?;
         manifest.push(rel_str);
     }
-
-    cache.finalize_build(build_key.as_bytes(), &manifest)?;
+    cache.finalize_unit(unit_key, &manifest)?;
     Ok(manifest.len())
 }
 
-pub fn restore(
+/// Restore a unit's artifacts from cache into `target_dir`.
+pub fn restore_unit(
     cache: &dyn CacheBackend,
-    build_key: &CacheKey,
+    unit_key: &[u8; 32],
     target_dir: &Path,
-    n_threads: usize,
 ) -> Result<usize> {
-    let manifest = cache.list_artifacts(build_key.as_bytes())?;
+    let manifest = cache.list_artifacts(unit_key)?;
     if manifest.is_empty() {
         return Ok(0);
     }
-
     let mut dirs_seen = std::collections::HashSet::new();
     for rel_str in &manifest {
         let dest = target_dir.join(rel_str);
@@ -48,93 +134,13 @@ pub fn restore(
             }
         }
     }
-
-    let n_threads = n_threads.max(1);
-    let chunk_size = (manifest.len() + n_threads - 1) / n_threads;
-    let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let restored = std::sync::atomic::AtomicUsize::new(0);
-
-    let errors = &errors;
-    let restored = &restored;
-    std::thread::scope(|s| {
-        for chunk in manifest.chunks(chunk_size) {
-            s.spawn(move || {
-                for rel_str in chunk {
-                    let dest = target_dir.join(rel_str);
-                    let written = cache.restore_artifact(
-                        build_key.as_bytes(),
-                        rel_str,
-                        &dest,
-                    );
-                    match written {
-                        Ok(true) => {
-                            restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Ok(false) => {
-                            tracing::warn!("missing cached file: {}", rel_str);
-                        }
-                        Err(e) => {
-                            errors.lock().unwrap().push(format!("{}: {}", rel_str, e));
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    let errs = errors.lock().unwrap();
-    if !errs.is_empty() {
-        tracing::warn!("{} files failed to restore", errs.len());
-    }
-
-    Ok(restored.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-pub fn snapshot_target_dir(target_dir: &Path) -> std::collections::HashMap<PathBuf, std::time::SystemTime> {
-    let mut snapshot = std::collections::HashMap::new();
-    if !target_dir.exists() {
-        return snapshot;
-    }
-    for entry in walkdir::WalkDir::new(target_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    snapshot.insert(entry.into_path(), mtime);
-                }
-            }
+    let mut restored = 0;
+    for rel_str in &manifest {
+        let dest = target_dir.join(rel_str);
+        match cache.restore_artifact(unit_key, rel_str, &dest)? {
+            true => restored += 1,
+            false => tracing::warn!("missing cached file: {}", rel_str),
         }
     }
-    snapshot
-}
-
-pub fn diff_target_dir(
-    target_dir: &Path,
-    before: &std::collections::HashMap<PathBuf, std::time::SystemTime>,
-) -> Vec<PathBuf> {
-    let mut new_files = Vec::new();
-    if !target_dir.exists() {
-        return new_files;
-    }
-    for entry in walkdir::WalkDir::new(target_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            let path = entry.into_path();
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if let Ok(mtime) = meta.modified() {
-                    match before.get(&path) {
-                        None => new_files.push(path),
-                        Some(old_mtime) if mtime > *old_mtime => new_files.push(path),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    new_files.sort();
-    new_files
+    Ok(restored)
 }

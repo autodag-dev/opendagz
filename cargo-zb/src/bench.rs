@@ -173,7 +173,6 @@ pub fn run_bench(
     manifest_path: &Path,
     release: bool,
     cache_backend: &str,
-    io_threads: usize,
     with_sccache: bool,
 ) -> Result<()> {
     let manifest_path = manifest_path.canonicalize()
@@ -189,7 +188,7 @@ pub fn run_bench(
     eprintln!("=== Benchmarking: {project_name} ===");
     eprintln!("  manifest: {}", manifest_path.display());
     eprintln!("  rustc: {rustc_version}");
-    eprintln!("  backend: {cache_backend}, io_threads: {io_threads}");
+    eprintln!("  backend: {cache_backend}");
     if with_sccache {
         eprintln!("  sccache: enabled");
     }
@@ -222,12 +221,10 @@ pub fn run_bench(
     let zb_exe = self_exe()?;
     let zb_exe_str = zb_exe.to_string_lossy().to_string();
     let manifest_str = manifest_path.to_string_lossy().to_string();
-    let io_threads_str = io_threads.to_string();
     let mut zb_args: Vec<&str> = vec![
         "zb",
         "--manifest-path", &manifest_str,
         "--cache-backend", cache_backend,
-        "--io-threads", &io_threads_str,
     ];
     if release {
         zb_args.push("--release");

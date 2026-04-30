@@ -12,12 +12,49 @@ impl CacheKey {
         &self.0
     }
 
+    #[allow(dead_code)]
     pub fn to_hex(&self) -> String {
         blake3::Hash::from(self.0).to_hex().to_string()
     }
 }
 
-/// Compute cache keys for all units in the graph (bottom-up topo order).
+/// Combine a unit's static_key with the content hash of its dynamic inputs and
+/// the **full_keys of its dependencies** to yield the unit's full content-addressed
+/// cache key.
+///
+/// Why dep full_keys: when a build script injects env vars via `cargo:rustc-env=`,
+/// the dependent crate's compilation receives those values and rustc records them
+/// as `# env-dep:NAME=VALUE` in the dep-info. Those env vars are NOT in the user's
+/// process env at cargo-zb invocation time, so hashing current values misses the
+/// change. Folding dep full_keys propagates "any dep's content has changed" up to
+/// consumers, which is exactly the invalidation cargo's own DepFingerprint
+/// achieves at the unit-graph level.
+pub fn combine_full_key(
+    static_key: &CacheKey,
+    dynamic_content_hash: &[u8; 32],
+    dep_full_keys: &[CacheKey],
+) -> CacheKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-zb-full-v2\0");
+    hasher.update(static_key.as_bytes());
+    hasher.update(dynamic_content_hash);
+    let mut deps: Vec<&CacheKey> = dep_full_keys.iter().collect();
+    deps.sort_by(|a, b| a.0.cmp(&b.0));
+    for k in deps {
+        hasher.update(k.as_bytes());
+    }
+    hasher.update(b"deps-end\0");
+    CacheKey(*hasher.finalize().as_bytes())
+}
+
+/// Compute static cache keys for all units in the graph (bottom-up topo order).
+///
+/// The "static" qualifier distinguishes this from the unit's full content-addressed
+/// key. A static_key folds in everything cargo-zb can know without running anything:
+/// rustc version, pkg metadata, target, profile, features, rustflags, recursive dep
+/// keys, and `*.rs` source contents (for path packages). It does NOT cover external
+/// file deps reached via macros or build script `rerun-if-*` declarations — those
+/// land in the dynamic inputs, harvested post-build.
 pub fn compute_cache_keys(
     unit_graph: &UnitGraph,
     roots: &[Unit],
