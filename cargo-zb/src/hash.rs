@@ -102,7 +102,8 @@ fn compute_unit_key(
 ) -> Result<CacheKey> {
     let mut hasher = blake3::Hasher::new();
 
-    hasher.update(b"cargo-zb-v1\0");
+    // v2: added edition, [lints] rustflags, and the remaining Profile fields.
+    hasher.update(b"cargo-zb-v2\0");
 
     hasher.update(rustc_version.as_bytes());
     hasher.update(b"\0");
@@ -122,6 +123,19 @@ fn compute_unit_key(
 
     hasher.update(format!("{:?}", unit.mode).as_bytes());
     hasher.update(b"\0");
+
+    // Edition changes compilation semantics but nothing else we hash
+    // (cargo tracks it under "Target flags" in its fingerprint).
+    hasher.update(unit.target.edition().to_string().as_bytes());
+    hasher.update(b"\0");
+
+    // [lints] tables are passed to rustc as extra flags outside
+    // unit.rustflags; cargo fingerprints them via lint_rustflags().
+    for flag in unit.pkg.manifest().lint_rustflags() {
+        hasher.update(flag.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"lints-end\0");
 
     hash_profile(&mut hasher, &unit.profile);
 
@@ -194,11 +208,29 @@ fn hash_profile(hasher: &mut blake3::Hasher, profile: &cargo::core::profiles::Pr
     hasher.update(b"\0");
     hasher.update(format!("{:?}", profile.strip).as_bytes());
     hasher.update(b"\0");
+    hasher.update(format!("{:?}", profile.codegen_backend).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", profile.split_debuginfo).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", profile.rpath).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", profile.incremental).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", profile.trim_paths).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", profile.hint_mostly_unused).as_bytes());
+    hasher.update(b"\0");
+    for flag in profile.rustflags.iter() {
+        hasher.update(flag.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"profile-rustflags-end\0");
 }
 
-fn hash_source_files(hasher: &mut blake3::Hasher, unit: &Unit) -> Result<()> {
-    let pkg_root = unit.pkg.root();
-
+/// The `*.rs` files under a package root that participate in a path package's
+/// static_key. Single source of truth for the walk so the mid-build mtime
+/// guard checks exactly the set that was hashed.
+pub fn package_rs_files(pkg_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<_> = walkdir::WalkDir::new(pkg_root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -210,6 +242,29 @@ fn hash_source_files(hasher: &mut blake3::Hasher, unit: &Unit) -> Result<()> {
         .map(|e| e.into_path())
         .collect();
     paths.sort();
+    paths
+}
+
+/// True if any static-key source file was modified after `t0` (or vanished
+/// since the key was computed). Used to decline caching units whose
+/// static_key may describe different content than rustc actually read.
+pub fn sources_modified_since(pkg_root: &std::path::Path, t0: std::time::SystemTime) -> bool {
+    for path in package_rs_files(pkg_root) {
+        let newer = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|m| m > t0)
+            // stat failure post-walk = file racing us; be conservative
+            .unwrap_or(true);
+        if newer {
+            return true;
+        }
+    }
+    false
+}
+
+fn hash_source_files(hasher: &mut blake3::Hasher, unit: &Unit) -> Result<()> {
+    let pkg_root = unit.pkg.root();
+    let paths = package_rs_files(pkg_root);
 
     for path in &paths {
         let rel = path.strip_prefix(pkg_root).unwrap_or(path);

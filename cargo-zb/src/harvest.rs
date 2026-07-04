@@ -17,11 +17,94 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use cargo::core::compiler::{BuildRunner, CompileMode, Unit};
+use cargo::core::manifest::TargetSourcePath;
 
-use crate::cache::{hash_path_current, DynEnv, DynPath, DynamicInputs};
+use crate::cache::{
+    hash_package_dir, hash_path_current, package_dir_entry_filter, DynEnv, DynPath, DynamicInputs,
+};
+
+/// When this unit's build job started, per cargo's `invoked.timestamp` marker
+/// (written before the job runs; untouched when cargo deems the unit fresh —
+/// in which case cargo itself already attested no input is newer than it).
+/// `None` means we can't establish a start time and must not cache the unit.
+pub fn unit_build_start(runner: &BuildRunner<'_, '_>, unit: &Unit) -> Option<SystemTime> {
+    let dir = if unit.mode == CompileMode::RunCustomBuild {
+        runner.files().build_script_run_dir(unit)
+    } else {
+        runner.files().fingerprint_dir(unit)
+    };
+    std::fs::metadata(dir.join("invoked.timestamp"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Mid-build modification guard: true if any dynamic input path was touched
+/// after `t0` (the unit's build start). rustc/the build script may then have
+/// read different content than we hashed at harvest — caching would record a
+/// content→artifact mapping that never held. Mirrors cargo's dep-info mtime
+/// rewind to `invoked.timestamp` (see cargo's fingerprint module docs), which
+/// exists for exactly this race.
+pub fn inputs_modified_since(inputs: &DynamicInputs, t0: SystemTime) -> Result<bool> {
+    for p in &inputs.paths {
+        if path_modified_since(&p.path, t0, p.package_scan)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn path_modified_since(path: &Path, t0: SystemTime, package_scan: bool) -> Result<bool> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        // Consistently-missing is attested by the sentinel hash; nothing raced.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    if meta.is_file() {
+        return Ok(meta.modified()? > t0);
+    }
+    // Directory: check every entry, dirs included — a deletion bumps the
+    // parent dir's mtime, which is the only trace it leaves.
+    let walk = walkdir::WalkDir::new(path).into_iter();
+    let entries: Box<dyn Iterator<Item = walkdir::DirEntry>> = if package_scan {
+        Box::new(walk.filter_entry(package_dir_entry_filter).filter_map(|e| e.ok()))
+    } else {
+        Box::new(walk.filter_map(|e| e.ok()))
+    };
+    for entry in entries {
+        let newer = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|m| m > t0)
+            .unwrap_or(true); // can't stat = can't attest
+        if newer {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The cwd cargo gave rustc for this unit — dep-info paths are relative to it.
+/// Mirrors `cargo::util::workspace::path_args` (minus the unstable
+/// `-Zroot-dir`): path-source units whose src path lives under the workspace
+/// root are compiled with paths relative to the workspace root; everything
+/// else runs from the package root.
+fn rustc_cwd(runner: &BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
+    let ws_root = runner.bcx.ws.root();
+    if unit.pkg.package_id().source_id().is_path() {
+        if let TargetSourcePath::Path(src) = unit.target.src_path() {
+            if src.starts_with(ws_root) {
+                return ws_root.to_path_buf();
+            }
+        }
+    }
+    unit.pkg.root().to_path_buf()
+}
 
 /// Harvest the unit's dynamic inputs (paths + env vars) from the post-build state.
 ///
@@ -77,12 +160,19 @@ fn harvest_compile(
     let info = parse_rustc_dep_info(&dep_info_path)
         .with_context(|| format!("parsing {}", dep_info_path.display()))?;
 
+    // rustc emits dep-info paths relative to its cwd (for path packages,
+    // usually the workspace root — NOT our process cwd). Absolutize before
+    // filtering or hashing, else entries resolve against wherever cargo-zb
+    // happened to run from and silently degrade to the "missing" sentinel.
+    let cwd = rustc_cwd(runner, unit);
+
     // Drop files inside pkg_root with .rs extension — already in static_key. Keep:
     //   - any path outside pkg_root (macro-resolved external includes, OUT_DIR refs)
     //   - non-.rs files inside pkg_root (e.g. .fbs, .html, .json)
     let mut path_set: Vec<PathBuf> = info
         .files
         .into_iter()
+        .map(|p: PathBuf| if p.is_absolute() { p } else { cwd.join(p) })
         .filter(|p: &PathBuf| {
             if !p.starts_with(pkg_root) {
                 return true;
@@ -93,13 +183,25 @@ fn harvest_compile(
     path_set.sort();
     path_set.dedup();
 
-    let paths: Vec<DynPath> = path_set
-        .into_iter()
-        .map(|p| {
-            let h = hash_path_current(&p).unwrap_or([0u8; 32]);
-            DynPath { path: p, stored_hash: h }
-        })
-        .collect();
+    // Every path here was just read by rustc, so it must exist and be
+    // readable. Missing/unreadable now means it changed under us mid-build —
+    // don't cache the unit (it rebuilds and caches next run).
+    let mut paths: Vec<DynPath> = Vec::with_capacity(path_set.len());
+    for p in path_set {
+        let h = match hash_path_current(&p) {
+            Ok(h) if h != [0u8; 32] => h,
+            Ok(_) | Err(_) => {
+                tracing::debug!(
+                    "dep-info path unreadable post-build for {} ({}): {} — not caching",
+                    unit.pkg.name(),
+                    unit.target.name(),
+                    p.display()
+                );
+                return Ok(None);
+            }
+        };
+        paths.push(DynPath { path: p, stored_hash: h, package_scan: false });
+    }
     let envs: Vec<DynEnv> = info
         .env
         .into_iter()
@@ -150,11 +252,27 @@ fn harvest_run_custom_build(
     env_names.sort();
     env_names.dedup();
 
+    // No rerun-if directives at all: cargo's rule (fingerprint/mod.rs) is
+    // that any change to any file in the package reruns the script. The
+    // static_key only covers *.rs, so C sources / assets would otherwise be
+    // invisible. Track the whole package dir as a single content-hashed input.
+    if paths.is_empty() && env_names.is_empty() {
+        let h = hash_package_dir(pkg_root).unwrap_or([0u8; 32]);
+        return Ok(Some(DynamicInputs {
+            paths: vec![DynPath {
+                path: pkg_root.to_path_buf(),
+                stored_hash: h,
+                package_scan: true,
+            }],
+            envs: vec![],
+        }));
+    }
+
     let path_entries: Vec<DynPath> = paths
         .into_iter()
         .map(|p| {
             let h = hash_path_current(&p).unwrap_or([0u8; 32]);
-            DynPath { path: p, stored_hash: h }
+            DynPath { path: p, stored_hash: h, package_scan: false }
         })
         .collect();
     let env_entries: Vec<DynEnv> = env_names

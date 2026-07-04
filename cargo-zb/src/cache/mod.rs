@@ -38,6 +38,22 @@ pub struct DynPath {
     /// blake3 of the file/dir contents at the time this manifest was written.
     /// `[0; 32]` is the sentinel for "missing" (the file didn't exist).
     pub stored_hash: [u8; 32],
+    /// True for the "whole package is the input" entry recorded when a build
+    /// script emits no `rerun-if-*` directives (cargo's fallback rule). Hashed
+    /// via `hash_package_dir` (excludes `target`/`.git`) instead of
+    /// `hash_path_current`.
+    #[serde(default)]
+    pub package_scan: bool,
+}
+
+impl DynPath {
+    pub fn current_hash(&self) -> Result<[u8; 32]> {
+        if self.package_scan {
+            hash_package_dir(&self.path)
+        } else {
+            hash_path_current(&self.path)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,11 +93,13 @@ impl DynamicInputs {
     /// `rerun-if-*` lists across runs.
     pub fn shape_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dyn-inputs-shape-v2\0");
-        let mut paths: Vec<&PathBuf> = self.paths.iter().map(|p| &p.path).collect();
+        hasher.update(b"dyn-inputs-shape-v3\0");
+        let mut paths: Vec<(&PathBuf, bool)> =
+            self.paths.iter().map(|p| (&p.path, p.package_scan)).collect();
         paths.sort();
-        for p in &paths {
+        for (p, scan) in &paths {
             hasher.update(p.to_string_lossy().as_bytes());
+            hasher.update(if *scan { b"\x01" } else { b"\x00" });
             hasher.update(b"\0");
         }
         hasher.update(b"paths-end\0");
@@ -101,13 +119,17 @@ impl DynamicInputs {
     /// `stored_hash`/`stored_value` snapshots.
     pub fn content_hash<F: Fn(&str) -> Option<String>>(&self, env_lookup: F) -> Result<[u8; 32]> {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dyn-inputs-content-v2\0");
+        // v3: bumped when dep-info paths switched from cwd-relative to
+        // absolute and package_scan was added — entries recorded under the
+        // old (unsound) resolution must never produce a hit.
+        hasher.update(b"dyn-inputs-content-v3\0");
 
         let mut paths: Vec<&DynPath> = self.paths.iter().collect();
         paths.sort_by(|a, b| a.path.cmp(&b.path));
         for p in &paths {
-            let h = hash_path_current(&p.path)?;
+            let h = p.current_hash()?;
             hasher.update(p.path.to_string_lossy().as_bytes());
+            hasher.update(if p.package_scan { b"p" } else { b"e" });
             hasher.update(b"\0");
             hasher.update(&h);
         }
@@ -139,7 +161,7 @@ impl DynamicInputs {
     pub fn diff_current<F: Fn(&str) -> Option<String>>(&self, env_lookup: F) -> Result<DiffReport> {
         let mut report = DiffReport::default();
         for p in &self.paths {
-            let cur = hash_path_current(&p.path)?;
+            let cur = p.current_hash()?;
             let stored_missing = p.stored_hash == [0u8; 32];
             let cur_missing = cur == [0u8; 32];
             match (stored_missing, cur_missing) {
@@ -200,6 +222,46 @@ pub fn hash_path_current(path: &Path) -> Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// Walk filter for package-dir scans: skip `target` and `.git` directories.
+/// Single source of truth shared by `hash_package_dir` and the mid-build
+/// mtime guard so both see the same file set.
+pub fn package_dir_entry_filter(e: &walkdir::DirEntry) -> bool {
+    e.depth() == 0
+        || !(e.file_type().is_dir()
+            && (e.file_name() == "target" || e.file_name() == ".git"))
+}
+
+/// Hash every file under a package root, excluding `target` and `.git`
+/// directories. Backs the "no `rerun-if-*` directives ⇒ the whole package is
+/// the input" rule cargo applies to build scripts (see cargo's
+/// `fingerprint/mod.rs`). Content-based where cargo uses mtimes; over-inclusive
+/// versus cargo's gitignore handling, so the worst case is a spurious rebuild,
+/// never a stale hit. A fresh walk on every call so file additions/removals
+/// change the hash.
+pub fn hash_package_dir(root: &Path) -> Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pkg-dir-v1\0");
+    let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(package_dir_entry_filter)
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+    paths.sort();
+    for path in &paths {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    hasher.update(b"pkg-dir-end\0");
+    Ok(*hasher.finalize().as_bytes())
+}
+
 pub trait CacheBackend: Send + Sync {
     fn contains_unit(&self, unit_key: &[u8; 32]) -> Result<bool>;
 
@@ -244,3 +306,7 @@ pub trait CacheBackend: Send + Sync {
 
     fn name(&self) -> &str;
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod tests;

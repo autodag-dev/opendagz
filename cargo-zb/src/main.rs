@@ -384,6 +384,9 @@ fn run_cached_build(cli: &ZbArgs) -> Result<()> {
     let target_dir = cargo_interop::target_dir(&ws);
     debug!("unit graph: {} units, {} roots", bcx.unit_graph.len(), bcx.roots.len());
 
+    // Taken just before static keys read source contents: any source whose
+    // mtime later exceeds this may differ from what the keys describe.
+    let t_keys = std::time::SystemTime::now();
     let static_keys = hash::compute_cache_keys(&bcx.unit_graph, &bcx.roots, &rustc_version)?;
     let t_setup = t_start.elapsed();
 
@@ -417,7 +420,7 @@ fn run_cached_build(cli: &ZbArgs) -> Result<()> {
         let manifests = cache.list_dynamic_inputs(static_key.as_bytes())?;
         let mut best_diff: Option<cache::DiffReport> = None;
         for inputs in &manifests {
-            if let Ok(d) = inputs.diff_current(|n| std::env::var(n).ok()) {
+            if let Ok(d) = inputs.diff_current(|n| cargo_interop::env_lookup(&gctx, n)) {
                 let total = d.total();
                 let curr_total = best_diff.as_ref().map(|x| x.total()).unwrap_or(usize::MAX);
                 if total < curr_total {
@@ -440,7 +443,7 @@ fn run_cached_build(cli: &ZbArgs) -> Result<()> {
                 // is set (suggests a real env change at zb-time). Diffs where
                 // current is None but stored was Some(...) are typically
                 // build-script-injected envs that never appear in our env.
-                || d.changed_envs.iter().any(|n| std::env::var(n).is_ok())
+                || d.changed_envs.iter().any(|n| cargo_interop::env_lookup(&gctx, n).is_some())
         }).unwrap_or(false);
 
         let own_would_miss = manifests.is_empty() || diff_meaningful;
@@ -466,7 +469,7 @@ fn run_cached_build(cli: &ZbArgs) -> Result<()> {
 
         let mut hit = false;
         for inputs in &manifests {
-            let content = match inputs.content_hash(|n| std::env::var(n).ok()) {
+            let content = match inputs.content_hash(|n| cargo_interop::env_lookup(&gctx, n)) {
                 Ok(c) => c,
                 Err(e) => {
                     debug!("dynamic content hash failed for {}: {e}", unit.pkg.name());
@@ -538,6 +541,29 @@ fn run_cached_build(cli: &ZbArgs) -> Result<()> {
                 }
             };
 
+            // Mid-build modification guard: if any input was touched after
+            // this unit's job started (invoked.timestamp) — or any static-key
+            // source after we hashed it — rustc may have consumed different
+            // content than we just attested. Caching would poison the key
+            // permanently; skipping just means this unit re-caches next run.
+            let raced = match harvest::unit_build_start(&runner, unit) {
+                Some(t0) => {
+                    harvest::inputs_modified_since(&inputs, t0)?
+                        || (unit.pkg.package_id().source_id().is_path()
+                            && hash::sources_modified_since(unit.pkg.root(), t_keys))
+                }
+                None => true, // no start marker — can't attest anything
+            };
+            if raced {
+                debug!(
+                    "inputs modified during build for {} ({}); not caching",
+                    unit.pkg.name(),
+                    unit.target.name()
+                );
+                skipped += 1;
+                continue;
+            }
+
             let dep_full_keys: Vec<hash::CacheKey> = bcx
                 .unit_graph
                 .get(unit)
@@ -561,7 +587,7 @@ fn run_cached_build(cli: &ZbArgs) -> Result<()> {
                 continue;
             }
 
-            let content = inputs.content_hash(|n| std::env::var(n).ok())?;
+            let content = inputs.content_hash(|n| cargo_interop::env_lookup(&gctx, n))?;
             let full = hash::combine_full_key(static_key, &content, &dep_full_keys);
             full_keys.insert(unit.clone(), full);
 

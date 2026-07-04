@@ -93,8 +93,9 @@ pub fn topo_order(unit_graph: &UnitGraph, roots: &[Unit]) -> Vec<Unit> {
     order
 }
 
-/// Helper: look up a previously-stored env value via cargo's env_config or stdlib env.
-#[allow(dead_code)]
+/// Env lookup with cargo's precedence for rerun-if-env fingerprints:
+/// `[env]` config table first, then the process env — mirrors
+/// `LocalFingerprint::from_env` in cargo's fingerprint module.
 pub fn env_lookup(gctx: &GlobalContext, name: &str) -> Option<String> {
     if let Ok(cfg) = gctx.env_config() {
         if let Some(v) = cfg.get(name) {
